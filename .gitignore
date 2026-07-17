@@ -1,0 +1,17 @@
+# user data (state, TLE caches, Space-Track credentials — never commit)
+data/
+
+# build environments & artifacts (release/ carries the packaged app zip)
+.venv-build/
+build/
+dist/
+__pycache__/
+*.pyc
+
+# icon build intermediates
+build_icon/SatObserver.iconset/
+
+# original screenshot lives in docs/screenshot.png
+screenshot/
+
+.DS_Store
