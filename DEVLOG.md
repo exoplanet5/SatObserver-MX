@@ -290,6 +290,16 @@ one right-click → Open). Verified: embedded server serves the bundled
 frontend, state loads from Application Support, all features live in the
 WKWebView window.
 
+**Windows build (2026-07-18):** PyInstaller cannot cross-compile, so
+`.github/workflows/build-windows.yml` builds on a `windows-latest` runner
+(Python 3.12, pywebview/EdgeWebView2 + PyInstaller, `--add-data "app;app"`)
+and commits `release/SatObserver-MX-windows-x64.zip` back to the repo.
+`server.py` gained per-platform bundled data dirs (macOS Application
+Support / Windows `%APPDATA%\SatObserverMX` / Linux `~/.local/share`);
+`build_icon/SatObserver.ico` generated from the same 1024-px icon render.
+First CI run: success (18 MB zip, exe + pythonnet/WebView2 stack + all
+frontend assets verified inside the archive).
+
 ---
 
 ## 6. Running & files
