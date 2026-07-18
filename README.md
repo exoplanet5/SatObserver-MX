@@ -12,14 +12,22 @@ packaging — is in [DEVLOG.md](DEVLOG.md); module APIs are in [CONTRACT.md](CON
 
 ## Requirements
 
-**To run the packaged app** (`release/SatObserver-MX-macOS-arm64.zip`):
-- macOS on Apple Silicon (arm64); built and tested on macOS 15
-- No runtime dependencies — Python, imagery, and star catalog are bundled
-- Network access for TLE fetching (cached TLEs work offline)
-- Optional: a free [space-track.org](https://www.space-track.org) account for
-  Space-Track queries and batch TLE refresh
-- The app is unsigned: first launch on a machine other than the build machine
-  needs right-click → Open once
+**Packaged apps** (in `release/`) — no runtime dependencies; Python, imagery,
+and star catalog are bundled. Network access is needed for TLE fetching
+(cached TLEs work offline). Optional: a free
+[space-track.org](https://www.space-track.org) account for Space-Track
+queries and batch TLE refresh.
+
+- **macOS** (`SatObserver-MX-macOS-arm64.zip`): Apple Silicon; built and
+  tested on macOS 15. Unsigned — first launch on another machine needs
+  right-click → Open once.
+- **Windows** (`SatObserver-MX-windows-x64.zip`): Windows 10/11 x64 with the
+  Microsoft Edge **WebView2 Runtime** (preinstalled on Windows 11 and most
+  updated Windows 10 systems; otherwise install the
+  [Evergreen runtime](https://developer.microsoft.com/microsoft-edge/webview2/)).
+  Unsigned — SmartScreen may ask once: More info → Run anyway. Built
+  automatically by GitHub Actions
+  ([build-windows.yml](.github/workflows/build-windows.yml)).
 
 **To run from source** (browser mode):
 - Python ≥ 3.10 — **standard library only**, no packages needed
@@ -31,9 +39,12 @@ packaging — is in [DEVLOG.md](DEVLOG.md); module APIs are in [CONTRACT.md](CON
 
 ## Run
 
-**Standalone app**: unzip `release/SatObserver-MX-macOS-arm64.zip`, drag
+**macOS app**: unzip `release/SatObserver-MX-macOS-arm64.zip`, drag
 `SatObserver-MX.app` to /Applications if you like, double-click. Native window,
 Cmd-Q quits. User data lives in `~/Library/Application Support/SatObserverMX/`.
+
+**Windows app**: unzip `release/SatObserver-MX-windows-x64.zip`, run
+`SatObserver-MX\SatObserver-MX.exe`. User data lives in `%APPDATA%\SatObserverMX\`.
 
 **Dev / browser mode**:
 
@@ -110,8 +121,9 @@ server.py            backend: static server + JSON API (Python stdlib only)
 desktop.py           native-window shell for the packaged app (pywebview)
 app/                 frontend (classic JS, no build step) + NASA imagery + vendor libs
 build_icon/          app icon generator (orthographic Blue Marble render)
-release/             packaged app zip (macOS arm64)
+release/             packaged apps (macOS arm64 zip, Windows x64 zip)
 docs/                screenshot
+.github/workflows/   Windows build automation (GitHub Actions)
 CONTRACT.md          binding module-API contract used during development
 DEVLOG.md            full development log
 SatObserver.command  double-click dev launcher

@@ -39,7 +39,12 @@ IS_BUNDLED = bool(getattr(sys, "_MEIPASS", None))
 BASE_DIR = pathlib.Path(getattr(sys, "_MEIPASS", None) or SCRIPT_DIR)
 APP_DIR = (BASE_DIR / "app").resolve()
 if IS_BUNDLED:
-    DATA_DIR = pathlib.Path.home() / "Library" / "Application Support" / "SatObserverMX"
+    if sys.platform == "darwin":
+        DATA_DIR = pathlib.Path.home() / "Library" / "Application Support" / "SatObserverMX"
+    elif os.name == "nt":
+        DATA_DIR = pathlib.Path(os.environ.get("APPDATA") or pathlib.Path.home()) / "SatObserverMX"
+    else:
+        DATA_DIR = pathlib.Path.home() / ".local" / "share" / "SatObserverMX"
 else:
     DATA_DIR = SCRIPT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
