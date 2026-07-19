@@ -21,13 +21,12 @@ queries and batch TLE refresh.
 - **macOS** (`SatObserver-MX-macOS-arm64.zip`): Apple Silicon; built and
   tested on macOS 15. Unsigned — first launch on another machine needs
   right-click → Open once.
-- **Windows** (`SatObserver-MX-windows-x64.zip`): Windows 10/11 x64 with the
-  Microsoft Edge **WebView2 Runtime** (preinstalled on Windows 11 and most
-  updated Windows 10 systems; otherwise install the
-  [Evergreen runtime](https://developer.microsoft.com/microsoft-edge/webview2/)).
-  Unsigned — SmartScreen may ask once: More info → Run anyway. Built
-  automatically by GitHub Actions
-  ([build-windows.yml](.github/workflows/build-windows.yml)).
+- **Windows** (`SatObserver-MX-windows-x64.zip`): Windows 10 x64
+  (version 1803+) or Windows 11, with the Microsoft Edge **WebView2
+  Runtime**. ⚠ The app was developed and tested on **macOS**; the Windows
+  package is produced automatically by CI and has **not been tested on real
+  Windows hardware** — read [Windows notes & caveats](#windows-notes--caveats)
+  before using it.
 
 **To run from source** (browser mode):
 - Python ≥ 3.10 — **standard library only**, no packages needed
@@ -43,8 +42,10 @@ queries and batch TLE refresh.
 `SatObserver-MX.app` to /Applications if you like, double-click. Native window,
 Cmd-Q quits. User data lives in `~/Library/Application Support/SatObserverMX/`.
 
-**Windows app**: unzip `release/SatObserver-MX-windows-x64.zip`, run
-`SatObserver-MX\SatObserver-MX.exe`. User data lives in `%APPDATA%\SatObserverMX\`.
+**Windows app**: unzip `release/SatObserver-MX-windows-x64.zip` keeping the
+folder intact, run `SatObserver-MX\SatObserver-MX.exe`. User data lives in
+`%APPDATA%\SatObserverMX\`. Read
+[Windows notes & caveats](#windows-notes--caveats) first.
 
 **Dev / browser mode**:
 
@@ -62,6 +63,82 @@ Options: `--port N`, `--no-browser`. In dev mode data lives in `./data/`.
   --name "SatObserver-MX" --icon build_icon/SatObserver.icns \
   --add-data "app:app" --osx-bundle-identifier "local.satobserver.mx" desktop.py
 ```
+
+## Windows notes & caveats
+
+SatObserver-MX was developed and tested on macOS. The Windows package is
+built automatically by GitHub Actions
+([build-windows.yml](.github/workflows/build-windows.yml)) on a
+`windows-latest` runner: the archive contents (exe, bundled Python +
+pythonnet/WebView2 stack, frontend assets) have been verified, but the app
+has **never been launch-tested on a physical Windows machine**. Treat it as
+a best-effort build; the from-source browser mode at the end of this
+section is the guaranteed fallback.
+
+**Detailed requirements**
+
+- Windows 10 x64, version 1803 or later, or Windows 11. ARM PCs only via
+  x64 emulation (untested).
+- **Microsoft Edge WebView2 Runtime** — the app window is a WebView2 view.
+  Preinstalled on Windows 11 and on up-to-date Windows 10; otherwise
+  install Microsoft's free
+  [Evergreen runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
+  If it is missing, the app exits without ever showing a window.
+- **.NET Framework 4.7.2 or later** (pywebview's Windows backend runs via
+  pythonnet) — included since Windows 10 1803, so normally already present.
+- Network access for TLE fetching; previously cached TLEs work offline.
+
+**Installing & first launch**
+
+1. Right-click the downloaded zip → Properties → tick **Unblock** → OK,
+   *then* Extract All (clears the mark-of-the-web for all files in one
+   step instead of per-file).
+2. Keep the extracted folder intact: `SatObserver-MX.exe` needs the
+   `_internal\` folder beside it. Don't copy the exe out alone, and don't
+   run it from inside the zip preview window.
+3. The exe is **unsigned**, so SmartScreen will likely warn on first run:
+   **More info → Run anyway** (needed once per machine).
+
+**Known caveats**
+
+- **Antivirus false positives**: unsigned PyInstaller executables are a
+  classic heuristic-AV target — Defender or third-party AV may flag or
+  quarantine the exe. Restore it and add an exclusion, build it yourself
+  (below), or use the from-source fallback.
+- The UI is served by an internal web server on **loopback only**
+  (`127.0.0.1:8474`, falling back to 8475–8484 if busy): nothing is
+  exposed to the network and no firewall rule is needed.
+- User data lives in `%APPDATA%\SatObserverMX\`. Space-Track credentials,
+  if you save them, are stored there in **plaintext** (`config.json`);
+  Windows applies no file protection beyond your user profile's normal
+  ACLs — avoid saving them on a shared account.
+- High-DPI scaling and multi-monitor window placement are untested on
+  Windows.
+- If the packaged exe misbehaves, please open a
+  [GitHub issue](https://github.com/exoplanet5/SatObserver-MX/issues) with
+  your Windows version and what happened.
+
+**Build it yourself** (on Windows; mirrors what CI does):
+
+```powershell
+pip install pywebview pyinstaller
+pyinstaller --noconfirm --clean --windowed --name SatObserver-MX ^
+  --icon build_icon\SatObserver.ico --add-data "app;app" ^
+  --collect-all webview desktop.py
+```
+
+**Guaranteed fallback — run from source in a browser**
+
+The backend needs only the Python standard library, so with any Python
+≥ 3.10 installed:
+
+```powershell
+py server.py
+```
+
+serves the identical UI at http://127.0.0.1:8474 in your default browser —
+every feature works the same, just in a browser tab instead of a native
+window. In this mode data lives in `data\` next to `server.py`.
 
 ## Features
 

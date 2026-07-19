@@ -300,6 +300,15 @@ Support / Windows `%APPDATA%\SatObserverMX` / Linux `~/.local/share`);
 First CI run: success (18 MB zip, exe + pythonnet/WebView2 stack + all
 frontend assets verified inside the archive).
 
+**Windows README hardening (2026-07-19):** since development and testing
+happened entirely on macOS and the Windows exe has never run on real
+hardware, README gained an explicit disclaimer plus a "Windows notes &
+caveats" section: detailed requirements (Win10 1803+/11 x64, WebView2
+Runtime, .NET 4.7.2+), unblock-zip install steps, SmartScreen and
+antivirus-false-positive notes, plaintext-credential warning for
+`%APPDATA%`, a local PowerShell build recipe mirroring CI, and the
+from-source browser mode as the guaranteed fallback.
+
 ---
 
 ## 6. Running & files
