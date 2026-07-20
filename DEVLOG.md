@@ -275,6 +275,17 @@ Greenwich).
     2026-166A/B) fetched hours before liftoff, refresh + dead-file
     fallback exercised through the UI.
 
+12. **Per-family hide/show** (2026-07-20) — 👁 button in each family header
+    (before the GT batch toggle). Hiding excludes the family in ONE place —
+    `state.allActiveSats()` — which every view (2D map, 3D globe, sky
+    chart, passes) already consumes, so markers, labels, tracks, and pass
+    predictions all vanish together; per-sat GT/OR/FP/LB flags are never
+    touched, so showing again restores the exact prior display state.
+    Hiding a family containing the current selection clears the selection.
+    Hidden families render dimmed with a struck-through name; `hidden`
+    persists in state.json and survives restarts (verified live across a
+    reload, including exact-restore of mixed per-sat toggle patterns).
+
 ---
 
 ## 5. Phase 3 — standalone macOS app (2026-07-16)

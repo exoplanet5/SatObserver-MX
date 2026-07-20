@@ -216,6 +216,11 @@ input[type="color"].swatch::-webkit-color-swatch { border: none; border-radius: 
 }
 .tog.on { color: var(--accent); border-color: var(--accent-dim); background: rgba(79,195,247,.08); }
 .tog:hover { color: var(--fg); }
+.tog.eye { padding: 1px 4px; margin-right: 4px; }
+.tog.eye:not(.on) { text-decoration: line-through; }
+/* hidden family: dim the whole block; keep controls fully readable on hover */
+.fam.hid .fam-name, .fam.hid .sat-row { opacity: .45; }
+.fam.hid .fam-name { text-decoration: line-through; }
 .icon-btn { cursor: pointer; color: var(--fg-dim); padding: 0 3px; font-size: 12px; }
 .icon-btn:hover { color: var(--danger); }
 .icon-btn.accent:hover { color: var(--accent); }

@@ -266,9 +266,27 @@
         return;
       }
       SAT.state.families.forEach(fam => {
-        const famEl = U.el('div', { class: 'fam' });
+        const famEl = U.el('div', { class: 'fam' + (fam.hidden ? ' hid' : '') });
         const caret = U.el('span', { class: 'mono dim' }, fam.expanded ? '▾' : '▸');
         const nameEl = U.el('span', { class: 'fam-name' }, fam.name);
+        // visibility: hides the whole family everywhere (markers included)
+        // without touching per-sat toggles, so showing again restores the
+        // exact previous display state
+        const eyeBtn = U.el('span', {
+          class: 'tog eye' + (fam.hidden ? '' : ' on'),
+          title: fam.hidden
+            ? 'family hidden — click to show (each satellite keeps its previous toggles)'
+            : 'hide this family everywhere (markers, labels, tracks, passes); toggles are remembered',
+          onclick: e => {
+            e.stopPropagation();
+            fam.hidden = !fam.hidden;
+            if (fam.hidden && fam.sats.some(s => s.id === SAT.state.selection.satId)) {
+              SAT.state.setSelection(null);
+            }
+            SAT.state.save(); SAT.bus.emit('sats-changed', {});
+            renderFamilies();
+          },
+        }, '👁');
         // family-wide toggle buttons
         const famTogs = TOGS.map(([key, lbl, title]) => {
           const allOn = fam.sats.length && fam.sats.every(s => s.show[key]);
@@ -307,7 +325,7 @@
           class: 'fam-head',
           onclick: () => { fam.expanded = !fam.expanded; SAT.state.save(); renderFamilies(); },
         }, [caret, nameEl, U.el('span', { class: 'dim' }, '(' + fam.sats.length + ')'), msg,
-            U.el('span', { class: 'sat-togs' }, famTogs), refrBtn, delFam]);
+            U.el('span', { class: 'sat-togs' }, [eyeBtn, famTogs]), refrBtn, delFam]);
         famEl.appendChild(head);
 
         if (fam.expanded) fam.sats.forEach(sat => {

@@ -57,6 +57,7 @@
   state.allActiveSats = function () {
     const out = [];
     for (const fam of state.families) {
+      if (fam.hidden) continue;   // family hidden: nothing renders anywhere
       for (const s of fam.sats) if (SAT.prop.ensureSatrec(s)) out.push(s);
     }
     return out;

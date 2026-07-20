@@ -170,8 +170,11 @@ window. In this mode data lives in `data\` next to `server.py`.
   by default). Per-satellite toggles for ground track (GT), orbit (OR),
   footprint (FP), label (LB); per-family batch toggles; per-sat colors; a ⓘ
   button opens a detail panel (NORAD, int'l designator, launch date & site
-  from CelesTrak SATCAT, epoch, and full mean orbital elements). The import
-  section folds away and has its own height splitter.
+  from CelesTrak SATCAT, epoch, and full mean orbital elements). A 👁 button
+  per family hides the whole family everywhere (markers, labels, tracks,
+  passes) without touching per-satellite toggles — clicking again restores
+  the exact display state from before hiding. The import section folds away
+  and has its own height splitter.
 - **Click-to-select** in every view: clicking a satellite turns on its ground
   track, orbit, and footprint; clicking it again reverts it to label-only;
   selecting another satellite leaves the previous one's display as-is.

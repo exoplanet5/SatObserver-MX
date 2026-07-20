@@ -78,7 +78,10 @@ Events (payloads):
 Data (JSON-serializable, persisted to backend `/api/state` debounced 800 ms):
 
 ```js
-SAT.state.families = [{ id, name, expanded:true, sats: [SatEntry, ...] }]
+SAT.state.families = [{ id, name, expanded:true, hidden:false, sats: [SatEntry, ...] }]
+// hidden:true — family excluded from allActiveSats(): nothing renders in any
+// view (markers, labels, tracks, passes). Per-sat show flags are untouched,
+// so unhiding restores the exact previous display state.
 // SatEntry:
 { id: "s_<rand>", norad: 25544, name: "ISS (ZARYA)",
   l1: "1 25544U ...", l2: "2 25544U ...",
@@ -106,8 +109,9 @@ SAT.state.selection = { satId: null }
 ```
 
 Methods:
-- `allActiveSats() -> SatEntry[]` flat list of all sats in all families (each entry
-  guaranteed to have a valid `_satrec`; invalid TLEs excluded).
+- `allActiveSats() -> SatEntry[]` flat list of all sats in all non-hidden
+  families (each entry guaranteed to have a valid `_satrec`; invalid TLEs and
+  `hidden` families excluded — this is the single hide point for all views).
 - `getSat(satId) -> SatEntry|null`, `getFamilyOfSat(satId) -> family|null`
 - `setSelection(satId|null)` — emits `'selection-changed'`.
 - `activeLocation() -> location|null` (the one with `active:true`).
