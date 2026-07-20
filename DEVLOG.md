@@ -247,6 +247,34 @@ Greenwich).
     Polaris at az 0.7°/alt 39.4° from Beijing, Vega high in the July evening
     sky, per-minute ISS pass ticks 07:39→07:48 UTC.
 
+11. **CelesTrak SupGP source** (2026-07-20) — new "CelesTrak SupGP" tab
+    (between CelesTrak and Space-Track) for supplemental GP data: TLEs
+    CelesTrak fits to operator ephemerides, more accurate than standard GP
+    and available pre-launch/pre-catalog. Two problems needed a strategy:
+    (a) **file discovery** — FILE names are a mix of stable operator files
+    (iss, css, starlink, gps…) and launch-specific ones that appear/expire
+    unscheduled (starlink-g17-39 + backup-window b1…b10): the backend
+    scrapes the supplemental index page (`/api/supgp/index`, 2 h cache,
+    stale fallback, labels recovered from the table cells), the tab shows
+    both classes in a grouped dropdown with a ⟳ re-scan button plus a
+    manual FILE override for names not yet indexed; (b) **multi-segment
+    sets** — supplemental files carry many piecewise-fitted "[Segment NN]"
+    TLEs per object (live ISS file: 60 segments spanning 15 days, epochs in
+    the future). The server collapses them to one catalog entry per NORAD
+    id carrying all segments (`segs`), and `propagate.js` gained
+    `recFor(sat, date)`: every propagation entry point (positions, ground
+    tracks, orbit rings, look angles → passes) uses the segment whose epoch
+    is nearest the requested time, memoized per segment, so tracks and pass
+    predictions stitch across segments; render caches invalidate on segment
+    switch via satrec identity. Family ⟳ refresh now posts each sat's
+    source so SupGP imports re-fetch their own file first (Space-Track/
+    CelesTrak fallback when a launch file is retired, stale segs dropped).
+    Verified live: ISS 60-seg import propagates at 425.6 km with segment
+    switches at ±36 h, CSS 28 segs collapse to one object, pre-launch
+    STARLINK-G17-39 STACK/SINGLE (placeholder catnums 72000/72001,
+    2026-166A/B) fetched hours before liftoff, refresh + dead-file
+    fallback exercised through the UI.
+
 ---
 
 ## 5. Phase 3 — standalone macOS app (2026-07-16)

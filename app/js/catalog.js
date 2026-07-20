@@ -184,17 +184,21 @@
         const existing = fam.sats.find(s => s.norad === t.norad);
         if (existing) {
           existing.l1 = t.l1; existing.l2 = t.l2; existing.name = t.name || existing.name;
+          if (t.segs) existing.segs = t.segs; else delete existing.segs;
           delete existing._satrec; delete existing._satrecBad;
+          delete existing._segRecs; delete existing._segMs;
           existing.source = cat.source; existing.fetched = cat.fetched;
           updated++;
         } else {
-          fam.sats.push({
+          const s = {
             id: U.uuid('s'), norad: t.norad, name: t.name || ('OBJECT ' + t.norad),
             l1: t.l1, l2: t.l2, color: nextColor(),
             // default: label only — user turns tracks/footprints on per sat
             show: { groundTrack: false, orbit: false, footprint: false, label: true },
             source: cat.source, fetched: cat.fetched,
-          });
+          };
+          if (t.segs) s.segs = t.segs;   // SupGP piecewise TLE segments
+          fam.sats.push(s);
           added++;
         }
       });
@@ -218,7 +222,8 @@
       try {
         const r = await fetch('/api/refresh/tle', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ norads: fam.sats.map(s => s.norad) }),
+          // source lets the backend re-fetch SupGP-imported sats from their file
+          body: JSON.stringify({ sats: fam.sats.map(s => ({ norad: s.norad, source: s.source || '' })) }),
         });
         const d = await r.json();
         if (!d || d.ok === false) throw new Error((d && d.error) || 'refresh failed');
@@ -228,9 +233,13 @@
           const t = byNorad.get(s.norad);
           if (!t) return;
           s.l1 = t.l1; s.l2 = t.l2;
+          // segments must track the refresh source: stale ones would otherwise
+          // shadow the fresh l1/l2 during propagation
+          if (t.segs) s.segs = t.segs; else delete s.segs;
           if (t.name) s.name = t.name;
           s.fetched = d.fetched;
           delete s._satrec; delete s._satrecBad;
+          delete s._segRecs; delete s._segMs;
           updated++;
         });
         SAT.prop.clearCaches();
@@ -288,7 +297,7 @@
         }, '🗑');
         const refrBtn = U.el('span', {
           class: 'icon-btn accent',
-          title: 'refresh TLEs for this family (Space-Track if credentials saved, else CelesTrak)',
+          title: 'refresh TLEs for this family (SupGP-imported sats from their SupGP file; others via Space-Track if credentials saved, else CelesTrak)',
           onclick: e => { e.stopPropagation(); refreshFamily(fam); },
         }, fam._refreshing ? '…' : '⟳');
         const msg = fam._refreshMsg

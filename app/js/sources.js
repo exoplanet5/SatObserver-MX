@@ -35,10 +35,10 @@
 
   function init(body, win) {
     const U = SAT.util;
-    const tabs = ['CelesTrak', 'Space-Track', 'McCants', 'Paste TLE', 'Cache'];
+    const tabs = ['CelesTrak', 'CelesTrak SupGP', 'Space-Track', 'McCants', 'Paste TLE', 'Cache'];
     const panes = {};
     const tabBtns = {};
-    const tabBar = U.el('div', { class: 'row', style: 'gap:2px;margin-bottom:8px' });
+    const tabBar = U.el('div', { class: 'row', style: 'gap:2px;margin-bottom:8px;flex-wrap:wrap' });
     const paneHost = U.el('div');
 
     function showTab(name) {
@@ -80,6 +80,75 @@
       const btnR = U.el('button', { class: 'btn', title: 'Bypass 2 h cache', onclick: () => go(true) }, '⟳ Force refresh');
       panes['CelesTrak'].appendChild(U.el('div', null, [
         U.el('div', { class: 'row' }, [U.el('span', { class: 'dim' }, 'Group'), sel, btn, btnR]),
+        status,
+      ]));
+    }
+
+    // ---------- CelesTrak SupGP ----------
+    {
+      const sel = U.el('select', { class: 'select', style: 'min-width:230px;max-width:330px' });
+      const fileIn = U.el('input', {
+        class: 'input', placeholder: 'manual FILE (optional)', style: 'width:170px',
+        title: 'Overrides the list — for a FILE name not (yet) in the index, e.g. a brand-new launch',
+      });
+      const status = U.el('div', { class: 'dim', style: 'margin-top:6px' }, '');
+      const listBtn = U.el('button', {
+        class: 'btn small', title: 'Re-scan the CelesTrak supplemental index (launch files appear/expire unscheduled)',
+        onclick: () => loadIndex(true),
+      }, '⟳ list');
+      async function loadIndex(force) {
+        sel.innerHTML = '';
+        sel.appendChild(U.el('option', { value: '' }, 'loading file list…'));
+        listBtn.disabled = true;
+        try {
+          const d = await api('/api/supgp/index' + (force ? '?refresh=1' : ''));
+          sel.innerHTML = '';
+          const stable = d.files.filter(f => !f.launch);
+          const launch = d.files.filter(f => f.launch);
+          const og1 = U.el('optgroup', { label: 'Operators (stable files)' });
+          stable.forEach(f => og1.appendChild(U.el('option', { value: f.file }, f.label + '  (' + f.file + ')')));
+          sel.appendChild(og1);
+          if (launch.length) {
+            const og2 = U.el('optgroup', { label: 'Launch-specific (appear/expire with launches)' });
+            launch.forEach(f => og2.appendChild(U.el('option', { value: f.file }, f.file + ' — ' + f.label)));
+            sel.appendChild(og2);
+          }
+          if (stable.some(f => f.file === 'iss')) sel.value = 'iss';
+          status.textContent = d.files.length + ' files (' + launch.length + ' launch-specific) · index fetched ' +
+            (d.fetched || '').replace('T', ' ').slice(0, 16) +
+            (d.stale ? ' (stale — network failed)' : '');
+          status.className = 'dim';
+        } catch (e) {
+          sel.innerHTML = '';
+          sel.appendChild(U.el('option', { value: '' }, 'file list unavailable — use manual FILE'));
+          status.textContent = '✗ ' + (e && e.message ? e.message : e);
+          status.className = 'err';
+        }
+        listBtn.disabled = false;
+      }
+      loadIndex(false);
+      const go = async (refresh) => {
+        const file = (fileIn.value.trim() || sel.value || '').toLowerCase();
+        if (!file || btn.disabled) return;
+        busy(btn, status, 'Fetching SupGP ' + file + ' from CelesTrak…');
+        btnR.disabled = true;
+        try {
+          const d = await api('/api/supgp/tle?file=' + encodeURIComponent(file) +
+            (refresh ? '&refresh=1' : ''));
+          btn.disabled = false; btnR.disabled = false;
+          acceptPayload(d, status);
+        } catch (e) { fail(btn, status, e); btnR.disabled = false; }
+      };
+      const btn = U.el('button', { class: 'btn primary', onclick: () => go(false) }, 'Fetch');
+      const btnR = U.el('button', { class: 'btn', title: 'Bypass 2 h cache', onclick: () => go(true) }, '⟳ Force refresh');
+      panes['CelesTrak SupGP'].appendChild(U.el('div', null, [
+        U.el('div', { class: 'row' }, [U.el('span', { class: 'dim' }, 'File'), sel, listBtn]),
+        U.el('div', { class: 'row', style: 'margin-top:6px' }, [fileIn, btn, btnR]),
+        U.el('div', { class: 'dim', style: 'font-size:11px;margin-top:4px' },
+          'Supplemental GP: TLEs fitted by CelesTrak to operator ephemerides (SpaceX, ISS, CSS, OneWeb…) — ' +
+          'usually more accurate than standard GP and available pre-launch/pre-catalog. Multi-segment sets ' +
+          '(e.g. ISS, CSS, launch stacks) import as one object per satellite; propagation automatically uses ' +
+          'the segment nearest the master-clock time. Family ⟳ re-fetches from the same SupGP file.'),
         status,
       ]));
     }

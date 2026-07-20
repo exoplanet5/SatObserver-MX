@@ -57,6 +57,9 @@ PORT_TRIES = 11  # 8474..8484
 # JSON (OMM) format: NORAD_CAT_ID is a full integer, unlike 5-char TLE fields
 CELESTRAK_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=json"
 CELESTRAK_CATNR_URL = "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=json"
+SUPGP_URL = ("https://celestrak.org/NORAD/elements/supplemental/"
+             "sup-gp.php?FILE={file}&FORMAT=json")
+SUPGP_INDEX_URL = "https://celestrak.org/NORAD/elements/supplemental/"
 SATCAT_URL = "https://celestrak.org/satcat/records.php?CATNR={norad}&FORMAT=JSON"
 SATCAT_FRESH_S = 30 * 86400   # SATCAT records are near-static; refresh monthly
 SPACETRACK_BASE = "https://www.space-track.org"
@@ -103,6 +106,7 @@ MIME_TYPES = {
 }
 
 CACHE_KEY_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
+SUPGP_FILE_RE = re.compile(r"[A-Za-z0-9.-]{1,60}\Z")   # sup-gp.php FILE names
 GROUP_ID_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
 
 _IO_LOCK = threading.Lock()  # serializes writes to data/ (replace() itself is atomic)
@@ -291,6 +295,90 @@ def omm_records_to_tles(records):
         except Exception:
             continue  # skip malformed records
     return out
+
+
+def _iso_unix(s):
+    """OMM EPOCH string (UTC, no zone suffix) -> unix seconds; 0.0 on failure."""
+    try:
+        return (datetime.datetime.fromisoformat(str(s).strip().rstrip("Zz"))
+                .replace(tzinfo=datetime.timezone.utc).timestamp())
+    except ValueError:
+        return 0.0
+
+
+SUPGP_SEG_RE = re.compile(r"\s*\[Segment\s*\d+\]\s*$", re.I)
+
+
+def supgp_records_to_tles(records):
+    """SupGP OMM records -> one entry per object.
+
+    Supplemental files may carry several piecewise-fitted TLE 'segments' per
+    object (e.g. "CSS [Segment 03]"), each best near its own epoch, epochs
+    often extending into the future (predicted operator ephemerides). We
+    collapse them: one catalog entry per NORAD id, `l1/l2` = the segment
+    whose epoch is nearest now, and — when there is more than one — the full
+    epoch-sorted list under `segs` so the frontend can propagate each moment
+    with the nearest segment.
+    """
+    groups, order = {}, []
+    for rec in records:
+        try:
+            norad = int(rec["NORAD_CAT_ID"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if norad not in groups:
+            groups[norad] = []
+            order.append(norad)
+        groups[norad].append(rec)
+    out, now = [], time.time()
+    for norad in order:
+        segs, name = [], ""
+        for rec in sorted(groups[norad], key=lambda r: str(r.get("EPOCH") or "")):
+            try:
+                l1, l2 = omm_to_tle(rec)
+            except Exception:
+                continue
+            segs.append({"epoch": str(rec.get("EPOCH") or ""), "l1": l1, "l2": l2})
+            if not name:
+                name = SUPGP_SEG_RE.sub("", str(rec.get("OBJECT_NAME") or "")).strip()
+        if not segs:
+            continue
+        best = min(range(len(segs)),
+                   key=lambda i: abs(_iso_unix(segs[i]["epoch"]) - now))
+        ent = {"name": name or f"OBJECT {norad}",
+               "l1": segs[best]["l1"], "l2": segs[best]["l2"], "norad": norad}
+        if len(segs) > 1:
+            ent["segs"] = segs
+        out.append(ent)
+    return out
+
+
+def parse_supgp_index(html):
+    """Scrape the supplemental index page for available FILE names.
+
+    The stable operator files (iss, css, starlink, …) sit in the main table
+    with a plain-text label; launch-specific files (starlink-g17-39,
+    …-g17-39b1, …) appear and expire with each launch, labeled 'X Pre-Launch'
+    or 'Backup Launch Opportunity #N'. Label = last text line preceding the
+    link in its table cell; launch-specific = name contains a digit.
+    """
+    files, seen = [], set()
+    for m in re.finditer(r'href="sup-gp\.php\?FILE=([A-Za-z0-9.-]+)&', html):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        cell = html.rfind("<td", 0, m.start())
+        chunk = html[cell:m.start()] if cell != -1 else html[max(0, m.start() - 300):m.start()]
+        chunk = re.sub(r"<[^>]*$", "", chunk)   # drop the link's own unterminated <a …
+        txt = re.sub(r"<(?:hr|br)[^>]*>", "\n", chunk)
+        txt = re.sub(r"<[^>]*>", " ", txt)
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in txt.split("\n")]
+        lines = [ln for ln in lines if ln]
+        label = (lines[-1] if lines else name)[:80]
+        files.append({"file": name, "label": label,
+                      "launch": bool(re.search(r"\d", name))})
+    return files
 
 
 def iso_now():
@@ -520,6 +608,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._respond(200, {"ok": True, "groups": groups})
             if path == "/api/celestrak/tle":
                 return self._celestrak_tle(qs)
+            if path == "/api/supgp/index":
+                return self._supgp_index(qs)
+            if path == "/api/supgp/tle":
+                return self._supgp_tle(qs)
             if path == "/api/spacetrack/config":
                 cfg = load_config()
                 return self._respond(200, {
@@ -610,6 +702,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
         cache_write(key, payload)
         self._respond(200, payload)
 
+    def _supgp_index(self, qs):
+        """List of currently available SupGP FILE names, scraped from the
+        supplemental index page (stable operator files + transient
+        launch-specific files). Cached like TLE fetches, stale fallback."""
+        key = "supgp_index"
+        refresh = qs.get("refresh") == "1"
+        cached = cache_read(key)
+        if (cached and not refresh
+                and time.time() - cached.get("fetchedUnix", 0) < CACHE_FRESH_S):
+            return self._respond(200, cached)
+        try:
+            html = http_get(SUPGP_INDEX_URL).decode("utf-8", "replace")
+        except Exception as e:
+            if cached:
+                return self._respond(200, {**cached, "stale": True})
+            raise ApiError(502, f"SupGP index fetch failed: {e}")
+        files = parse_supgp_index(html)
+        if not files:
+            raise ApiError(502, "SupGP index page yielded no FILE entries")
+        payload = {"ok": True, "fetched": iso_now(), "fetchedUnix": time.time(),
+                   "files": files}
+        cache_write(key, payload)
+        self._respond(200, payload)
+
+    def _supgp_tle(self, qs):
+        fname = (qs.get("file") or "").strip().lower()
+        if not SUPGP_FILE_RE.fullmatch(fname):
+            raise ApiError(400, "Missing or invalid 'file' parameter")
+        key = f"supgp_{fname}"
+        refresh = qs.get("refresh") == "1"
+        cached = cache_read(key)
+        if (cached and not refresh
+                and time.time() - cached.get("fetchedUnix", 0) < CACHE_FRESH_S):
+            return self._respond(200, cached)
+        url = SUPGP_URL.format(file=urllib.parse.quote(fname, safe=""))
+        try:
+            raw = http_get(url)
+        except Exception as e:
+            if cached:
+                return self._respond(200, {**cached, "stale": True})
+            raise ApiError(502, f"CelesTrak SupGP fetch failed: {e}")
+        text = raw.decode("utf-8", "replace")
+        try:
+            records = json.loads(text)
+        except ValueError:
+            raise ApiError(502, f"No SupGP data for file {fname!r} "
+                                f"(retired launch file?): {text[:120].strip()}")
+        tles = supgp_records_to_tles(records if isinstance(records, list) else [])
+        if not tles:
+            raise ApiError(502, f"SupGP file {fname!r} contained no elements")
+        payload = make_payload(f"supgp:{fname}", tles)
+        cache_write(key, payload)
+        self._respond(200, payload)
+
     def _spacetrack_tle(self):
         body = self._read_json_dict()
         query = body.get("query") or {}
@@ -691,13 +837,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- per-family TLE refresh -------------------------------------------------
     def _refresh_tle(self):
-        """Fetch the freshest TLE for a list of NORAD ids. Space-Track (one
-        batch query) when credentials are saved, else/plus CelesTrak per-object
-        fallback for whatever is still missing."""
+        """Fetch the freshest TLE for a list of NORAD ids.
+
+        Order: (1) satellites imported from a SupGP file re-fetch that same
+        file (operator ephemerides beat standard GP, and launch objects may
+        exist nowhere else yet); a retired/renamed file just drops through.
+        (2) Space-Track batch query when credentials are saved. (3) CelesTrak
+        per-object fallback for whatever is still missing."""
         body = self._read_json_dict()
-        raw_ids = body.get("norads")
+        sats_in = body.get("sats")
+        src_by_id = {}
+        if isinstance(sats_in, list) and sats_in:
+            raw_ids = []
+            for s in sats_in:
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    n = int(s.get("norad"))
+                except (TypeError, ValueError):
+                    continue
+                raw_ids.append(n)
+                src = str(s.get("source") or "")
+                if src.startswith("supgp:"):
+                    src_by_id[n] = src[len("supgp:"):]
+        else:
+            raw_ids = body.get("norads")
         if not isinstance(raw_ids, list) or not raw_ids:
-            raise ApiError(400, "Missing 'norads' list")
+            raise ApiError(400, "Missing 'sats' or 'norads' list")
         try:
             ids = sorted({int(n) for n in raw_ids})
         except (TypeError, ValueError):
@@ -706,14 +872,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ApiError(400, "Too many objects in one refresh (max 500)")
 
         results, notes = {}, []
-        cfg = load_config()
-        if cfg.get("identity") and cfg.get("password"):
+
+        supgp_files = {}
+        for n, f in src_by_id.items():
+            if SUPGP_FILE_RE.fullmatch(f):
+                supgp_files.setdefault(f, set()).add(n)
+        for f in sorted(supgp_files)[:10]:   # a family rarely spans many files
+            want = supgp_files[f]
             try:
-                url = spacetrack_query_url("norad", ",".join(map(str, ids)))
+                raw = http_get(SUPGP_URL.format(file=urllib.parse.quote(f, safe="")))
+                tles = supgp_records_to_tles(json.loads(raw.decode("utf-8", "replace")))
+            except Exception:
+                notes.append(f"SupGP {f} unavailable — using standard sources")
+                continue
+            got = 0
+            for t in tles:
+                if t["norad"] in want:
+                    results[t["norad"]] = {**t, "src": f"supgp:{f}"}
+                    got += 1
+            if got:
+                notes.append(f"SupGP {f}: {got}")
+            cache_write(f"supgp_{f}", make_payload(f"supgp:{f}", tles))
+
+        pending = [i for i in ids if i not in results]
+        cfg = load_config()
+        if pending and cfg.get("identity") and cfg.get("password"):
+            try:
+                url = spacetrack_query_url("norad", ",".join(map(str, pending)))
                 text = spacetrack_fetch(cfg["identity"], cfg["password"], url)
+                got = 0
                 for t in omm_records_to_tles(json.loads(text)):
-                    results[t["norad"]] = t
-                notes.append(f"Space-Track: {len(results)}")
+                    if t["norad"] not in results:
+                        results[t["norad"]] = t
+                        got += 1
+                notes.append(f"Space-Track: {got}")
             except ApiError as e:
                 notes.append(f"Space-Track failed: {e.msg}")
             except Exception as e:

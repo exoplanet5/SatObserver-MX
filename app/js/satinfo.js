@@ -54,8 +54,9 @@
   }
 
   function elements(sat) {
-    if (!SAT.prop.ensureSatrec(sat)) return null;
-    const r = sat._satrec;
+    // SupGP multi-segment sats: show the segment active at the sim time
+    const r = SAT.prop.recFor(sat, SAT.clock.getDate());
+    if (!r) return null;
     const R2D = 180 / Math.PI;
     const n = r.no_kozai || r.no;            // rad/min
     if (!n) return null;
@@ -71,7 +72,7 @@
       periodMin: 2 * Math.PI / n,
       perKm: a * (1 - r.ecco) - ReEq,
       apoKm: a * (1 + r.ecco) - ReEq,
-      epoch: SAT.prop.tleEpoch(sat),
+      epoch: SAT.prop.tleEpoch(sat, SAT.clock.getDate()),
     };
   }
 
@@ -123,11 +124,18 @@
       row('Launch site', '…', {}),
       row('Owner / type', '…', {}),
       row('Epoch (UTC)', el && el.epoch
-        ? U.fmtDate(el.epoch) + '  (' +
-          ((SAT.clock.getDate() - el.epoch) / 86400000).toFixed(1) + ' d old)'
+        ? U.fmtDate(el.epoch) + '  (' + (() => {
+            const d = (SAT.clock.getDate() - el.epoch) / 86400000;
+            return d >= 0 ? d.toFixed(1) + ' d old' : 'in ' + (-d).toFixed(1) + ' d';
+          })() + ')'
         : '—'),
       row('Source', (sat.source || '—') + (sat.fetched ? ' · fetched ' + String(sat.fetched).replace('T', ' ').slice(0, 16) : '')),
-    ]);
+    ].concat(sat.segs && sat.segs.length > 1 ? [
+      row('SupGP segments', sat.segs.length + ' fitted TLEs, epochs ' +
+        String(sat.segs[0].epoch).replace('T', ' ').slice(0, 16) + ' → ' +
+        String(sat.segs[sat.segs.length - 1].epoch).replace('T', ' ').slice(0, 16) +
+        ' (nearest to clock time is used)'),
+    ] : []));
     const launchDateCell = idBody.children[2].children[1];
     const launchSiteCell = idBody.children[3].children[1];
     const ownerCell = idBody.children[4].children[1];

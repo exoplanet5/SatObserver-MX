@@ -84,8 +84,12 @@ SAT.state.families = [{ id, name, expanded:true, sats: [SatEntry, ...] }]
   l1: "1 25544U ...", l2: "2 25544U ...",
   color: "#4fc3f7",
   show: { groundTrack: true, orbit: true, footprint: true, label: true },
-  source: "celestrak:stations", fetched: "2026-07-15T03:00:00Z" }
-// non-persisted runtime field: satEntry._satrec (satellite.js satrec) — created lazily by SAT.prop.
+  source: "celestrak:stations", fetched: "2026-07-15T03:00:00Z",
+  segs: [{epoch: "2026-07-20T00:00:00.000000", l1, l2}, ...] }  // optional: SupGP
+  // piecewise TLE segments, epoch-sorted; present only for multi-segment
+  // SupGP imports (source "supgp:<file>"). l1/l2 = segment nearest fetch time.
+// non-persisted runtime fields (stripped on save): _satrec (satellite.js satrec),
+// _satrecBad, _segRecs (per-segment satrec memo), _segMs (parsed seg epochs).
 
 SAT.state.locations = [{ id, name, latDeg, lonDeg, altM, show: true, active: false,
                          color: "#ff5252" }]
@@ -114,7 +118,12 @@ Methods:
 
 ## SAT.prop (propagate.js) — all SGP4 via global `satellite` (satellite.js 5.0)
 
-- `ensureSatrec(satEntry) -> bool` — build+memoize `_satrec`; false if TLE invalid.
+- `ensureSatrec(satEntry) -> bool` — build+memoize `_satrec` from l1/l2; false if TLE invalid.
+- `recFor(satEntry, date) -> satrec|null` — the satrec to propagate with at `date`:
+  for SupGP multi-segment sats the segment whose epoch is nearest `date`
+  (memoized per segment in `_segRecs`), else the base `_satrec`. All
+  propagation entry points below route through this, so segmented sats are
+  piecewise-propagated automatically (tracks/passes stitch across segments).
 - `geodetic(satEntry, date) -> null | { latDeg, lonDeg, heightKm, velKmS, eciPos:{x,y,z}, gmst }`
 - `periodMinutes(satEntry) -> number` (from satrec.no_kozai, rad/min).
 - `groundTrack(satEntry, date, minutesBack, minutesFwd) -> { points: [ {t:ms, latDeg, lonDeg, heightKm} | null ] }`
@@ -238,6 +247,18 @@ statics at `/` (correct MIME for html/css/js/jpg; `index.html` at `/`). JSON API
   parse 3-line TLE text -> `TlePayload`; disk-cache `data/cache/celestrak_<id>.json`;
   serve cache when fresh (<2 h) unless `refresh=1`; on network error, fall back to
   stale cache with `"stale":true`.
+- `GET /api/supgp/index[?refresh=1]` -> `{ok, fetched, files:[{file,label,launch:bool}]}`
+  — scrape `https://celestrak.org/NORAD/elements/supplemental/` for every
+  `sup-gp.php?FILE=<name>` link. Stable operator files (iss, css, starlink, gps, …)
+  have plain labels; launch-specific files (e.g. `starlink-g17-39`, `…b1`) appear
+  and expire with each launch (`launch:true` = name contains a digit). Cache
+  `supgp_index.json`, 2 h fresh, stale fallback.
+- `GET /api/supgp/tle?file=<name>[&refresh=1]` — fetch
+  `.../supplemental/sup-gp.php?FILE=<name>&FORMAT=json` (operator-ephemeris-fitted
+  OMM). Records are grouped by NORAD id: supplemental files may carry many
+  piecewise "[Segment NN]" TLEs per object → ONE payload entry per object,
+  `l1/l2` = segment nearest now, all segments (if >1) under `segs`. Source
+  `supgp:<file>`, cache `supgp_<file>.json`, 2 h fresh, stale fallback.
 - `POST /api/spacetrack/tle` body `{identity?, password?, save?:bool, query:{type, value}}`
   — login `https://www.space-track.org/ajaxauth/login` (POST form identity/password,
   cookie jar); `type`: `"norad"` (value = comma/space/newline-separated IDs) ->
@@ -254,6 +275,11 @@ statics at `/` (correct MIME for html/css/js/jpg; `index.html` at `/`). JSON API
   (`zipfile`+`io`), parse concatenated TLEs -> payload; cache `mccants_<name>.json`.
   Also accept plain `.tle`/`.txt` URLs (no zip).
 - `POST /api/text/tle` body `{text, label?}` — parse pasted TLE text -> payload (no cache).
+- `POST /api/refresh/tle` body `{sats:[{norad,source}]}` (legacy `{norads:[int]}`
+  accepted) -> `{ok, fetched, count, tles, missing, notes}` — freshest elements
+  per object: (1) sats whose `source` is `supgp:<file>` re-fetch that SupGP file
+  (entries carry `segs` + `src`; a retired file falls through), (2) Space-Track
+  batch when credentials saved, (3) CelesTrak per-object (≤60) for the rest.
 - `GET /api/cache` -> `{ok, entries:[{key, source, fetched, count}]}`;
   `GET /api/cache/<key>` -> cached TlePayload; `DELETE /api/cache/<key>`.
 - `GET /api/state` -> saved JSON or `{}` ; `PUT /api/state` (or POST, for

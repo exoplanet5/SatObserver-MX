@@ -143,10 +143,24 @@ window. In this mode data lives in `data\` next to `server.py`.
 ## Features
 
 - **TLE sources**: CelesTrak groups (stations, visual, Starlink, GPS, …),
+  **CelesTrak SupGP** supplemental data (see below),
   **Space-Track.org with your credentials** (NORAD IDs / INTLDES / name search /
   full catalog), Mike McCants zip links (classfd.zip, inttles.zip), paste-in
   TLEs. All fetches cached on disk (2 h freshness for CelesTrak; stale cache
-  served if network is down). **6-digit catalog numbers fully supported**: both
+  served if network is down).
+- **CelesTrak SupGP** (supplemental GP): TLEs fitted by CelesTrak to operator
+  ephemerides (SpaceX, ISS, CSS, OneWeb, Intelsat, …) — usually more accurate
+  than standard GP and available **pre-launch/pre-catalog**. The tab
+  auto-scrapes the supplemental index so both the stable operator files
+  (`iss`, `css`, `starlink`, …) and the unscheduled launch-specific files
+  (`starlink-g17-39`, backup windows `…b1`–`…bN`) appear in a grouped
+  dropdown, with a ⟳ re-scan button and a manual FILE override.
+  Multi-segment sets (ISS/CSS carry dozens of piecewise TLEs with epochs up
+  to two weeks ahead) import as **one object per satellite**; propagation,
+  tracks, and pass predictions automatically use the segment nearest the
+  master-clock time, switching segments as the clock moves. The per-family
+  ⟳ refresh re-fetches SupGP-imported objects from their own file and falls
+  back to Space-Track/CelesTrak when a launch file expires. **6-digit catalog numbers fully supported**: both
   fetchers use JSON (OMM) with integer `NORAD_CAT_ID`; TLE lines for the SGP4
   pipeline are taken from the record or synthesized server-side (validated
   byte-identical to CelesTrak's own TLEs), with Alpha-5 encoding where needed.
