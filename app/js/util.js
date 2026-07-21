@@ -171,6 +171,18 @@
     return Math.sqrt(px * px + py * py + pz * pz) > 6371.0;
   }
 
+  // Alt/az of a celestial body seen from a site, from the body's sub-point
+  // (the body is at zenith there). Exact for distant bodies (sun, stars);
+  // for the moon subtract horizontal parallax (~0.95° · cos alt) from elDeg.
+  function altAzFromSubpoint(latDeg, lonDeg, sub) {
+    const la1 = rad(latDeg), la2 = rad(sub.latDeg), dl = rad(sub.lonDeg - lonDeg);
+    const sinEl = Math.sin(la1) * Math.sin(la2) +
+      Math.cos(la1) * Math.cos(la2) * Math.cos(dl);
+    const az = Math.atan2(Math.sin(dl) * Math.cos(la2),
+      Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dl));
+    return { azDeg: (deg(az) + 360) % 360, elDeg: deg(Math.asin(clamp(sinEl, -1, 1))) };
+  }
+
   // Great-circle destination given bearing and angular distance (all degrees)
   function destPoint(latDeg, lonDeg, bearingDeg, angDistDeg) {
     const la1 = rad(latDeg), lo1 = rad(lonDeg), th = rad(bearingDeg), dl = rad(angDistDeg);
@@ -184,6 +196,6 @@
     pad2, pad4, fmtDate, fmtDateLocal, clamp, wrapLon, deg, rad, uuid,
     escapeHtml, debounce, el, julian,
     sunSubpoint, moonSubpoint, nightPolygon, isNight, destPoint,
-    sunEciUnit, sunAltitudeDeg, satSunlit,
+    sunEciUnit, sunAltitudeDeg, satSunlit, altAzFromSubpoint,
   };
 })();

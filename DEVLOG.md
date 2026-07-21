@@ -286,6 +286,22 @@ Greenwich).
     persists in state.json and survives restarts (verified live across a
     reload, including exact-restore of mixed per-sat toggle patterns).
 
+13. **Sky chart Sun & Moon** (2026-07-21) — ☉ toggle in the chart toolbar
+    (default on). Alt/az derived from the existing sub-point ephemerides via
+    a new `SAT.util.altAzFromSubpoint` (great-circle bearing + zenith
+    distance); the moon gets a mean horizontal-parallax correction
+    (−0.95°·cos el). Sun rendered in the 2D-map style (rayed disc); the moon
+    shows its **real phase**: dark disc + lit region built from the sun-side
+    semicircle closed by the terminator ellipse (semi-axis R·|cos ψ| from
+    the geocentric sun–moon elongation ψ), bright limb rotated to face the
+    sun's chart position (an illuminated-% label was dropped on user
+    review — just the phase drawing). Validated against
+    astropy 7.2 from the Beijing station (2026-07-21 08:00 UTC): sun az/el
+    match to 0.01°, moon to 0.13° topocentric, illumination 49% vs 47%;
+    bright-limb orientation pixel-verified on canvas; chart placement
+    astronomically sane (sun between Pollux and Procyon, first-quarter moon
+    beside Spica).
+
 ---
 
 ## 5. Phase 3 — standalone macOS app (2026-07-16)

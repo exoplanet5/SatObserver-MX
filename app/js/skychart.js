@@ -23,6 +23,7 @@
     if (c.starNames == null) c.starNames = false;
     if (c.constLines == null) c.constLines = false;
     if (c.constNames == null) c.constNames = false;
+    if (c.sunMoon == null) c.sunMoon = true;
     return c;
   }
 
@@ -121,6 +122,69 @@
     c = computeTrack(loc, sat, nowMs);
     trackCache.set(sat.id, c);
     return c;
+  }
+
+  // ---- sun & moon ----
+  function drawSunMoon(m, loc, date) {
+    if (!cfg().sunMoon) return;
+    var U = SAT.util;
+    var sunSub, moonSub;
+    try { sunSub = U.sunSubpoint(date); moonSub = U.moonSubpoint(date); } catch (e) { return; }
+    var sun = U.altAzFromSubpoint(loc.latDeg, loc.lonDeg, sunSub);
+    var moon = U.altAzFromSubpoint(loc.latDeg, loc.lonDeg, moonSub);
+    moon.elDeg -= 0.95 * Math.cos(moon.elDeg * Math.PI / 180); // lunar parallax (mean 57')
+
+    if (sun.elDeg > 0) {
+      var p = project(sun.azDeg, sun.elDeg, m);
+      ctx.strokeStyle = '#ffd54f';
+      ctx.lineWidth = 1.5;
+      for (var k = 0; k < 8; k++) {
+        var a = k * Math.PI / 4;
+        ctx.beginPath();
+        ctx.moveTo(p.x + Math.cos(a) * 7, p.y + Math.sin(a) * 7);
+        ctx.lineTo(p.x + Math.cos(a) * 11, p.y + Math.sin(a) * 11);
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffd54f';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(60,40,0,0.6)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    if (moon.elDeg > 0) {
+      var q = project(moon.azDeg, moon.elDeg, m);
+      // geocentric sun–moon elongation -> phase; terminator drawn accordingly
+      var f1 = moonSub.latDeg * Math.PI / 180, f2 = sunSub.latDeg * Math.PI / 180;
+      var dl = (sunSub.lonDeg - moonSub.lonDeg) * Math.PI / 180;
+      var cosPsi = Math.sin(f1) * Math.sin(f2) + Math.cos(f1) * Math.cos(f2) * Math.cos(dl);
+      // bright limb faces the sun's chart position (valid below horizon too:
+      // project() clamps el, keeping the azimuth direction)
+      var ps = project(sun.azDeg, sun.elDeg, m);
+      var phi = Math.atan2(ps.y - q.y, ps.x - q.x);
+      var R = 5.5;
+      ctx.save();
+      ctx.translate(q.x, q.y);
+      ctx.rotate(phi);                    // +x now points toward the sun
+      ctx.beginPath();                    // dark side
+      ctx.arc(0, 0, R, 0, Math.PI * 2);
+      ctx.fillStyle = '#3c4148';
+      ctx.fill();
+      ctx.beginPath();                    // lit side: sun-side semicircle …
+      ctx.arc(0, 0, R, -Math.PI / 2, Math.PI / 2, false);
+      // … closed by the terminator ellipse (toward the sun when crescent)
+      ctx.ellipse(0, 0, R * Math.abs(cosPsi), R, 0, Math.PI / 2, -Math.PI / 2, cosPsi > 0);
+      ctx.fillStyle = '#e6e2d6';
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(0, 0, R, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(8,10,14,0.7)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   // ---- drawing ----
@@ -354,6 +418,7 @@
 
     drawGrid(m);
     try { drawStars(m, loc, satellite.gstime(date)); } catch (e) { /* stars are optional */ }
+    try { drawSunMoon(m, loc, date); } catch (e) { /* sun/moon are optional */ }
 
     var selId = SAT.state.selection ? SAT.state.selection.satId : null;
     var sats = [];
@@ -518,6 +583,7 @@
       toolBtns.starNames.classList.toggle('skc-on', !!c.starNames);
       toolBtns.constLines.classList.toggle('skc-on', !!c.constLines);
       toolBtns.constNames.classList.toggle('skc-on', !!c.constNames);
+      toolBtns.sunMoon.classList.toggle('skc-on', !!c.sunMoon);
     }
     body.appendChild(SAT.util.el('div', { class: 'skc-toolbar' }, [
       tbtn('grid', '30°', 'elevation grid spacing: 30° / 10° per ring', function () {
@@ -527,6 +593,7 @@
         updateToolbar();
         requestRender();
       }),
+      tbtn('sunMoon', '☉', 'sun & moon (moon shows phase)', toggleLayer('sunMoon')),
       tbtn('stars', '✶', 'stars (to mag 4.6)', toggleLayer('stars')),
       tbtn('starNames', 'SN', 'bright star names', toggleLayer('starNames')),
       tbtn('constLines', 'CL', 'constellation lines', toggleLayer('constLines')),

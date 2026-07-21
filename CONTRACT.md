@@ -150,6 +150,9 @@ Methods:
 - `uuid(prefix) -> "prefix_xxxxxxxx"`
 - `sunSubpoint(date) -> {latDeg, lonDeg}` (low-precision solar ephemeris, ±0.01°)
 - `moonSubpoint(date) -> {latDeg, lonDeg}` (low-precision, ±0.3°)
+- `altAzFromSubpoint(latDeg, lonDeg, sub) -> {azDeg, elDeg}` — body's alt/az at a
+  site from its sub-point (exact for distant bodies; for the moon subtract
+  horizontal parallax ~0.95°·cos(el) from elDeg)
 - `nightPolygon(date, n=180) -> [{latDeg, lonDeg}...]` — polygon (in lon order,
   closed by consumer) tracing the terminator, plus helper
   `isNight(latDeg, lonDeg, sunSub) -> bool`

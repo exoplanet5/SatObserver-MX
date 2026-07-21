@@ -202,7 +202,10 @@ window. In this mode data lives in `data\` next to `server.py`.
   pass trajectories follow the GT toggle, are cut at a 1° rise/set threshold,
   and carry per-minute time-boxed ticks with AOS/LOS times. Toggleable star
   layers computed live from the master clock: ~1000 stars to mag 4.6,
-  bright-star names, constellation lines & names.
+  bright-star names, constellation lines & names. **Sun and Moon** markers
+  (☉ toggle): the moon is drawn with its real phase — terminator, bright
+  limb facing the sun — with topocentric parallax correction (positions
+  verified against astropy to ≈0.1°).
 - **Per-family TLE refresh**: the ⟳ button re-fetches every member's current
   TLE (one Space-Track batch query when credentials are saved, CelesTrak
   per-object fallback) and updates in place.
