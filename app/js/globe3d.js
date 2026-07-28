@@ -334,6 +334,11 @@
       new THREE.BufferGeometry(),
       new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.8 })
     );
+    // eclipsed (Earth-shadow) part of the ground track, drawn faint
+    var trackDim = new THREE.LineSegments(
+      new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.22 })
+    );
     var footGeo = new THREE.BufferGeometry();
     footGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(FOOT_CAP * 3), 3));
     footGeo.setDrawRange(0, 0);
@@ -341,18 +346,18 @@
       footGeo,
       new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.35 })
     );
-    [marker, pick, label, orbit, track, foot].forEach(function (o) {
+    [marker, pick, label, orbit, track, trackDim, foot].forEach(function (o) {
       o.frustumCulled = false;
       o.visible = false;
     });
-    scene.add(marker, pick, label, track, foot);
+    scene.add(marker, pick, label, track, trackDim, foot);
     eciGroup.add(orbit);
     return {
       sat: sat, marker: marker, pick: pick, label: label,
-      orbit: orbit, track: track, foot: foot,
+      orbit: orbit, track: track, trackDim: trackDim, foot: foot,
       labelKey: label.userData.labelKey, color: sat.color, name: labelText(sat),
       builtMs: -Infinity, periodMs: periodMsOf(sat),
-      orbitCount: 0, trackCount: 0, footCount: 0
+      orbitCount: 0, trackCount: 0, trackDimCount: 0, footCount: 0
     };
   }
 
@@ -376,19 +381,22 @@
       e.marker.material.color.copy(col);
       e.orbit.material.color.copy(col);
       e.track.material.color.copy(col);
+      e.trackDim.material.color.copy(col);
       e.foot.material.color.copy(col);
       e.color = sat.color;
     }
   }
 
   function disposeSatEntry(e) {
-    scene.remove(e.marker, e.pick, e.label, e.track, e.foot);
+    scene.remove(e.marker, e.pick, e.label, e.track, e.trackDim, e.foot);
     eciGroup.remove(e.orbit);
     e.marker.material.dispose();
     e.orbit.geometry.dispose();
     e.orbit.material.dispose();
     e.track.geometry.dispose();
     e.track.material.dispose();
+    e.trackDim.geometry.dispose();
+    e.trackDim.material.dispose();
     e.foot.geometry.dispose();
     e.foot.material.dispose();
     e.label.material.dispose();
@@ -451,21 +459,27 @@
     var gt = null;
     try { gt = SAT.prop.groundTrack(e.sat, curDate, 0, 0); } catch (err) { gt = null; }
     e.trackCount = 0;
+    e.trackDimCount = 0;
     var tp = gt && gt.points;
     if (tp && tp.length > 1) {
+      // sunlit segments -> bright line; Earth-shadow segments -> faint line
       var seg = new Float32Array((tp.length - 1) * 6);
-      var m = 0;
+      var segDim = new Float32Array((tp.length - 1) * 6);
+      var m = 0, md = 0;
       for (var j = 0; j < tp.length - 1; j++) {
         var a = tp[j], b = tp[j + 1];
         if (!a || !b) continue;
         geoToScene(a.latDeg, a.lonDeg, SURF_R, tmpV);
         geoToScene(b.latDeg, b.lonDeg, SURF_R, tmpV2);
-        seg[m * 6] = tmpV.x; seg[m * 6 + 1] = tmpV.y; seg[m * 6 + 2] = tmpV.z;
-        seg[m * 6 + 3] = tmpV2.x; seg[m * 6 + 4] = tmpV2.y; seg[m * 6 + 5] = tmpV2.z;
-        m++;
+        var dst = b.sunlit === false ? segDim : seg;
+        var k = b.sunlit === false ? md++ : m++;
+        dst[k * 6] = tmpV.x; dst[k * 6 + 1] = tmpV.y; dst[k * 6 + 2] = tmpV.z;
+        dst[k * 6 + 3] = tmpV2.x; dst[k * 6 + 4] = tmpV2.y; dst[k * 6 + 5] = tmpV2.z;
       }
       if (m > 0) setLineGeometry(e.track, seg, m * 2);
+      if (md > 0) setLineGeometry(e.trackDim, segDim, md * 2);
       e.trackCount = m * 2;
+      e.trackDimCount = md * 2;
     }
   }
 
@@ -492,7 +506,7 @@
     if (!g) {
       // SGP4 failed at this epoch: silently hide everything for this sat.
       e.marker.visible = e.pick.visible = e.label.visible = false;
-      e.foot.visible = e.orbit.visible = e.track.visible = false;
+      e.foot.visible = e.orbit.visible = e.track.visible = e.trackDim.visible = false;
       return;
     }
     eciToScene(g.eciPos, g.gmst, e.marker.position);
@@ -509,6 +523,7 @@
     if (force || Math.abs(nowMs - e.builtMs) > e.periodMs / 8) rebuildLines(e, nowMs);
     e.orbit.visible = show.orbit !== false && e.orbitCount > 1;
     e.track.visible = show.groundTrack !== false && e.trackCount > 1;
+    e.trackDim.visible = show.groundTrack !== false && e.trackDimCount > 1;
   }
 
   function updateSelectionVisuals() {

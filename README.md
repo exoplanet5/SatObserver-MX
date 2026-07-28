@@ -179,13 +179,15 @@ window. In this mode data lives in `data\` next to `server.py`.
   track, orbit, and footprint; clicking it again reverts it to label-only;
   selecting another satellite leaves the previous one's display as-is.
 - **2D Map**: NASA Blue Marble (terrain + bathymetry, no political borders),
-  pan/zoom, ground tracks (past dim / future bright), footprint circles,
+  pan/zoom, ground tracks (past dim / future bright; stretches where the
+  satellite is inside Earth's shadow are drawn dashed), footprint circles,
   day/night terminator, graticule, sun/moon subpoints, ground stations,
   live lat/lon/alt/vel + az/el/range readout.
 - **3D Globe**: textured Earth with night lights, satellites, orbits, ground
-  tracks, footprints, stations, stars, sun-synchronized lighting; screen-
-  constant labels and markers; **FS** mode rides the nadir line of the
-  selected satellite, looking straight down at the ground it overflies.
+  tracks (Earth-shadow stretches drawn faint), footprints, stations, stars,
+  sun-synchronized lighting; screen-constant labels and markers; **FS** mode
+  rides the nadir line of the selected satellite, looking straight down at
+  the ground it overflies.
 - **Master Clock**: free-running simulation clock, keyboard-editable
   `YYYY-MM-DD HH:MM:SS` (UTC) with per-segment ↑/↓ stepping
   (year/month/day/hour/min/sec), rate −1000×…+1000×, quick step buttons,
@@ -194,12 +196,18 @@ window. In this mode data lives in `data\` next to `server.py`.
   drives az/el/range readouts, pass predictions, and the sky chart.
 - **Passes window**: AOS/TCA/LOS pass predictions over the active station,
   min-elevation filter, optical visibility flag (● satellite sunlit + dark
-  site · ☼ daylight pass · ✕ satellite in Earth's shadow), click a pass to
-  jump the clock to it.
+  site · ☼ daylight pass · ✕ satellite in Earth's shadow), a **"● Visible
+  only" filter** (dark site after civil dusk + sunlit satellite) applied at
+  compute time, click a pass to jump the clock to it.
 - **Sky Chart window**: live polar az/el plot over the active station
   (elevation rings selectable 30°/10°, azimuth spokes every 45°, sky-view
-  E-left or map-view E-right). Satellites above the horizon are clickable;
-  pass trajectories follow the GT toggle, are cut at a 1° rise/set threshold,
+  E-left or map-view E-right). The sky disc tint steps automatically through
+  five twilight stages (daylight · civil · nautical · astronomical · night,
+  at sun altitudes 0/−6/−12/−18°) while the chart around it keeps the dark
+  theme, and a **faint Milky Way** (d3-celestial isophotes) appears in dark
+  skies. Satellites above the
+  horizon are clickable; pass trajectories follow the GT toggle, are cut at
+  a 1° rise/set threshold, show **Earth-shadow stretches dashed**,
   and carry per-minute time-boxed ticks with AOS/LOS times. Toggleable star
   layers computed live from the master clock: ~1000 stars to mag 4.6,
   bright-star names, constellation lines & names. **Sun and Moon** markers

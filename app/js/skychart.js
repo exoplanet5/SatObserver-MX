@@ -35,6 +35,17 @@
     return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
   }
 
+  // ---- sky-disc shade by twilight stage (discrete, no gradients) ----
+  // Only the area inside the horizon circle is tinted; outside it the chart
+  // keeps the dark theme background.
+  function skyBg(sunAlt) {
+    if (sunAlt >= 0) return '#1e3348';    // daylight
+    if (sunAlt >= -6) return '#182a3c';   // civil twilight
+    if (sunAlt >= -12) return '#131f2e';  // nautical twilight
+    if (sunAlt >= -18) return '#0e1620';  // astronomical twilight
+    return '#0a0e13';                     // night
+  }
+
   // ---- geometry ----
   function metrics() {
     var R = Math.max(30, Math.min(cssW, cssH) / 2 - 30);
@@ -107,8 +118,16 @@
     var N = 160, span = los - aos;
     for (var i = 0; i <= N; i++) {
       var ti = aos + span * i / N;
-      var la = SAT.prop.lookAngles(loc, sat, new Date(ti));
-      if (la && la.elDeg >= RISE_EL - 0.2) pts.push({ t: ti, az: la.azDeg, el: la.elDeg });
+      var di = new Date(ti);
+      var la = SAT.prop.lookAngles(loc, sat, di);
+      if (la && la.elDeg >= RISE_EL - 0.2) {
+        var lit = true;   // Earth-shadow state along the pass
+        try {
+          var g = SAT.prop.geodetic(sat, di);
+          if (g) lit = SAT.util.satSunlit(g.eciPos, di);
+        } catch (e) { /* default sunlit */ }
+        pts.push({ t: ti, az: la.azDeg, el: la.elDeg, sunlit: lit });
+      }
     }
     return { satId: sat.id, rec: sat._satrec, none: false, aosMs: aos, losMs: los, pts: pts, computedAt: nowMs };
   }
@@ -260,6 +279,43 @@
     return { altDeg: alt * R2D, azDeg: azDeg };
   }
 
+  // like project(), but without the horizon clamp — for filled sky shapes
+  // whose below-horizon parts must land outside the (clipped) horizon circle
+  function projectSky(azDeg, elDeg, m) {
+    var r = (90 - elDeg) / 90 * m.R;
+    var a = azDeg * D2R;
+    var sx = cfg().eastLeft ? -1 : 1;
+    return { x: m.cx + sx * r * Math.sin(a), y: m.cy - r * Math.cos(a) };
+  }
+
+  // faint Milky Way isophotes (d3-celestial contours), faded out in twilight
+  function drawMW(m, loc, gmst, dark) {
+    var mw = SAT.mwdata;
+    if (!mw || !cfg().stars || dark <= 0.02) return;
+    var lst = gmst + loc.lonDeg * D2R;
+    var sinLat = Math.sin(loc.latDeg * D2R), cosLat = Math.cos(loc.latDeg * D2R);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(m.cx, m.cy, m.R, 0, Math.PI * 2);
+    ctx.clip();
+    for (var L = 0; L < mw.levels.length; L++) {
+      var lev = mw.levels[L];
+      ctx.beginPath();
+      for (var ri = 0; ri < lev.rings.length; ri++) {
+        var ring = lev.rings[ri];
+        for (var i = 0; i < ring.length; i++) {
+          var a = altAz(ring[i][0], ring[i][1], lst, sinLat, cosLat);
+          var p = projectSky(a.azDeg, a.altDeg, m);
+          if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        }
+        ctx.closePath();
+      }
+      ctx.fillStyle = 'rgba(172,192,222,' + (lev.a * dark).toFixed(3) + ')';
+      ctx.fill('evenodd');
+    }
+    ctx.restore();
+  }
+
   function drawStars(m, loc, gmst) {
     var sd = SAT.stardata;
     var c = cfg();
@@ -353,7 +409,10 @@
       var q = tr.pts[i];
       var p = project(q.az, Math.max(q.el, RISE_EL), m);
       if (prev) {
-        ctx.strokeStyle = hexA(sat.color, q.t <= nowMs ? 0.35 : 0.85);
+        // eclipsed (Earth-shadow) stretches: dashed + dimmer
+        var ecl = q.sunlit === false;
+        ctx.strokeStyle = hexA(sat.color, (q.t <= nowMs ? 0.35 : 0.85) * (ecl ? 0.5 : 1));
+        ctx.setLineDash(ecl ? [3, 3] : []);
         ctx.beginPath();
         ctx.moveTo(prev.x, prev.y);
         ctx.lineTo(p.x, p.y);
@@ -361,6 +420,7 @@
       }
       prev = p;
     }
+    ctx.setLineDash([]);
     // time ticks along the track: per minute when the pass is short enough,
     // else the smallest interval that keeps <=16 labels (long/GEO passes)
     var durMin = (tr.losMs - tr.aosMs) / 60000;
@@ -401,11 +461,12 @@
     var m = metrics();
     markerHits = [];
 
+    var loc = SAT.state.activeLocation();
+
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0a0e13';
+    ctx.fillStyle = '#0a0e13';       // dark theme outside the horizon circle
     ctx.fillRect(0, 0, cssW, cssH);
 
-    var loc = SAT.state.activeLocation();
     if (!loc) {
       ctx.fillStyle = '#9aa4ae';
       ctx.font = '12px ' + MONO;
@@ -416,8 +477,20 @@
       return;
     }
 
+    var sunAlt = -90;
+    try { sunAlt = SAT.util.sunAltitudeDeg(loc.latDeg, loc.lonDeg, date); } catch (e) { sunAlt = -90; }
+    // sky disc tinted by twilight stage (daylight → night, discrete steps)
+    ctx.beginPath();
+    ctx.arc(m.cx, m.cy, m.R, 0, Math.PI * 2);
+    ctx.fillStyle = skyBg(sunAlt);
+    ctx.fill();
+
+    var gmst = satellite.gstime(date);
+    // Milky Way fades over twilight: full below sun alt -18°, gone above -6°
+    var mwDark = Math.max(0, Math.min(1, (-6 - sunAlt) / 12));
+    try { drawMW(m, loc, gmst, mwDark); } catch (e) { /* optional layer */ }
     drawGrid(m);
-    try { drawStars(m, loc, satellite.gstime(date)); } catch (e) { /* stars are optional */ }
+    try { drawStars(m, loc, gmst); } catch (e) { /* stars are optional */ }
     try { drawSunMoon(m, loc, date); } catch (e) { /* sun/moon are optional */ }
 
     var selId = SAT.state.selection ? SAT.state.selection.satId : null;

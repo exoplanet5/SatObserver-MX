@@ -302,6 +302,29 @@ Greenwich).
     astronomically sane (sun between Pollux and Procyon, first-quarter moon
     beside Spica).
 
+14. **Night-sky realism & visibility pass** (2026-07-28) — four features:
+    (a) **Milky Way** on the sky chart: d3-celestial mw.json isophotes
+    decimated to a 16 KB `vendor/mwdata.js` (5 stacked levels, 1162 pts),
+    filled even-odd through an unclamped polar projection clipped to the
+    horizon circle; verified against the real July evening sky (band from
+    Cassiopeia through Cygnus to the bright Sagittarius core). (b) The **sky disc tint steps** through five discrete twilight stages
+    (daylight / civil / nautical / astronomical / night at sun altitudes
+    0/−6/−12/−18°) — on user review the initial version (smooth gradient,
+    whole-canvas, brighter daylight) was changed to discrete steps, applied
+    only inside the horizon circle with the dark theme kept outside, and a
+    dimmer daylight shade; the Milky Way still fades out above −18° and is
+    gone by −6°. (c) **Earth-shadow distinction on
+    tracks**: `SAT.prop.groundTrack` samples now carry `sunlit` (shadow-
+    cylinder test), rendered dashed on the 2D map, faint on the 3D globe,
+    and dashed+dimmed on sky-chart pass trajectories — the ISS track was
+    verified switching styles exactly at the shadow entry inside the
+    terminator. (d) **Passes "● Visible only" filter** (dropdown before
+    Compute, persisted): keeps passes with dark site (sun < −6°) + sunlit
+    satellite at TCA; verified both ways — a 15-pass all-daylight window
+    filtered to zero, and a dusk window caught a real ● ISS pass at min-el 0.
+    Debug note: a "frozen renderer" during testing was Chrome throttling
+    rAF in an occluded tab — not an app bug; repaints resume on focus.
+
 ---
 
 ## 5. Phase 3 — standalone macOS app (2026-07-16)

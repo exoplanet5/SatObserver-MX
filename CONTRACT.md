@@ -102,7 +102,7 @@ SAT.state.settings = {
             showNightShade:true, trackMinutesBack:0 /*0 = auto: half period*/,
             trackMinutesFwd:0 /*0 = auto: one period*/, labelSize:11 },
   globe3d:{ showStars:true, showNightLights:true, showTerminator:true },
-  passes: { hours:24, minElevationDeg:10 },
+  passes: { hours:24, minElevationDeg:10, visibleOnly:false },
   layout: { <windowId>: {x,y,w,h,open} }   // maintained by SAT.windows
 }
 SAT.state.selection = { satId: null }
@@ -130,7 +130,9 @@ Methods:
   piecewise-propagated automatically (tracks/passes stitch across segments).
 - `geodetic(satEntry, date) -> null | { latDeg, lonDeg, heightKm, velKmS, eciPos:{x,y,z}, gmst }`
 - `periodMinutes(satEntry) -> number` (from satrec.no_kozai, rad/min).
-- `groundTrack(satEntry, date, minutesBack, minutesFwd) -> { points: [ {t:ms, latDeg, lonDeg, heightKm} | null ] }`
+- `groundTrack(satEntry, date, minutesBack, minutesFwd) -> { points: [ {t:ms, latDeg, lonDeg, heightKm, sunlit:bool} | null ] }`
+  (`sunlit` = satellite outside Earth's shadow at that sample — consumers
+  render eclipsed stretches dashed/faint)
   ~240 samples; **`null` entries mark antimeridian splits** (consumers start a new
   polyline at null). Internally cached per sat; cache auto-invalidates when the
   requested date drifts >1/8 period from cache center, on `'time' jumped:true`, and

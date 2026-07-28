@@ -108,6 +108,18 @@
     minElInput.step = '1';
     minElInput.style.width = '54px';
 
+    // optical-visibility filter: keep only passes that are ● visible
+    // (site sun below the horizon past civil dusk AND satellite sunlit at TCA)
+    var visSel = el('select', {
+      class: 'select',
+      title: 'Visible only: site in darkness (sun < −6°, i.e. after sunset ends) and satellite sunlit',
+    });
+    [['all', 'All passes'], ['visible', '● Visible only']].forEach(function (o) {
+      var opt = el('option', {}, o[1]);
+      opt.value = o[0];
+      visSel.appendChild(opt);
+    });
+
     var stationEl = el('span', { class: 'pas-station' }, '');
     var statusEl = el('span', { class: 'pas-status' }, '');
     var computeBtn = el('button', { class: 'btn small', onclick: onComputeClick }, 'Compute');
@@ -123,6 +135,7 @@
       scopeSel, durSel,
       el('span', { class: 'pas-lbl' }, 'min el ≥'), minElInput,
       el('span', { class: 'pas-lbl' }, '°'),
+      visSel,
       el('span', { class: 'pas-lbl' }, 'station:'), stationEl,
       computeBtn, skyBtn, statusEl
     ]);
@@ -136,11 +149,16 @@
       durSel.value = ([12, 24, 48].indexOf(ps.hours) >= 0) ? String(ps.hours) : '24';
       var me = Number(ps.minElevationDeg);
       minElInput.value = String(isFinite(me) ? me : 10);
+      visSel.value = ps.visibleOnly ? 'visible' : 'all';
     }
     syncControlsFromSettings();
 
     durSel.onchange = function () {
       passSettings().hours = parseInt(durSel.value, 10);
+      SAT.state.save();
+    };
+    visSel.onchange = function () {
+      passSettings().visibleOnly = visSel.value === 'visible';
       SAT.state.save();
     };
     minElInput.onchange = function () {
@@ -258,6 +276,7 @@
         t0: t0,
         t1: t0 + hours * 3600e3,
         minEl: minEl,
+        visOnly: visSel.value === 'visible',
         scopeLabel: scopeSel.value === 'selected' ? sats[0].name : sats.length + ' sats',
         satIdx: 0,
         cursor: t0,
@@ -402,6 +421,9 @@
         }
       } catch (e) { visState = null; }
 
+      // visible-only filter: dark site + sunlit satellite at TCA
+      if (job.visOnly && visState !== 'visible') return;
+
       job.found.push({
         sat: sat,
         aos: new Date(aosT),
@@ -434,7 +456,7 @@
       meta = {
         stationId: j.loc.id, stationName: j.loc.name,
         latDeg: j.loc.latDeg, lonDeg: j.loc.lonDeg, altM: j.loc.altM,
-        t0: j.t0, t1: j.t1, minEl: j.minEl, scopeLabel: j.scopeLabel
+        t0: j.t0, t1: j.t1, minEl: j.minEl, visOnly: j.visOnly, scopeLabel: j.scopeLabel
       };
       sortKey = 'aos';
       sortAsc = true;
@@ -491,6 +513,7 @@
           ' (' + meta.latDeg.toFixed(2) + '°, ' + meta.lonDeg.toFixed(2) + '°)',
         '· ' + U.fmtDate(new Date(meta.t0)) + ' → ' + U.fmtDate(new Date(meta.t1)) + ' UTC',
         '· min max-el ' + meta.minEl + '°',
+        meta.visOnly ? '· ● visible only' : '',
         '· ' + meta.scopeLabel,
         staleTag
       ]);
@@ -498,7 +521,9 @@
 
       if (!results.length) {
         resultsEl.appendChild(el('div', { class: 'pas-msg' },
-          'No passes with max elevation ≥ ' + meta.minEl + '° in this window.'));
+          meta.visOnly
+            ? 'No optically visible passes (dark site + sunlit satellite, max el ≥ ' + meta.minEl + '°) in this window.'
+            : 'No passes with max elevation ≥ ' + meta.minEl + '° in this window.'));
         return;
       }
 

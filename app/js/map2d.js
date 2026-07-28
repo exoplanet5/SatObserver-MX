@@ -328,7 +328,9 @@
     } catch (e) { return; }
     if (!gt || !gt.points || gt.points.length < 2) return;
 
+    // 4 paths: past/future × sunlit/eclipsed (eclipsed = dashed, dimmer)
     var past = new Path2D(), fut = new Path2D();
+    var pastEcl = new Path2D(), futEcl = new Path2D();
     function seg(path, aLon, aLat, bLon, bLat) {
       var pa = lonLatToPx(aLon, aLat, m), pb = lonLatToPx(bLon, bLat, m);
       path.moveTo(pa.x, pa.y);
@@ -340,17 +342,18 @@
       p = gt.points[i];
       if (!p) { prev = null; continue; }
       if (prev) {
+        var ecl = p.sunlit === false;   // shadow state of this sample
         if (p.t <= nowMs) {
-          seg(past, prev.lonDeg, prev.latDeg, p.lonDeg, p.latDeg);
+          seg(ecl ? pastEcl : past, prev.lonDeg, prev.latDeg, p.lonDeg, p.latDeg);
         } else if (prev.t >= nowMs) {
-          seg(fut, prev.lonDeg, prev.latDeg, p.lonDeg, p.latDeg);
+          seg(ecl ? futEcl : fut, prev.lonDeg, prev.latDeg, p.lonDeg, p.latDeg);
         } else {
           // Segment spans "now": split at the interpolated current position.
           var f = (nowMs - prev.t) / (p.t - prev.t);
           var mLon = prev.lonDeg + (p.lonDeg - prev.lonDeg) * f;
           var mLat = prev.latDeg + (p.latDeg - prev.latDeg) * f;
-          seg(past, prev.lonDeg, prev.latDeg, mLon, mLat);
-          seg(fut, mLon, mLat, p.lonDeg, p.latDeg);
+          seg(ecl ? pastEcl : past, prev.lonDeg, prev.latDeg, mLon, mLat);
+          seg(ecl ? futEcl : fut, mLon, mLat, p.lonDeg, p.latDeg);
         }
       }
       prev = p;
@@ -361,6 +364,10 @@
     ctx.strokeStyle = sat.color || '#4fc3f7';
     ctx.globalAlpha = 0.45; ctx.lineWidth = 1; ctx.stroke(past);
     ctx.globalAlpha = 0.9; ctx.lineWidth = 1.6; ctx.stroke(fut);
+    ctx.setLineDash([3, 4]);
+    ctx.globalAlpha = 0.22; ctx.lineWidth = 1; ctx.stroke(pastEcl);
+    ctx.globalAlpha = 0.45; ctx.lineWidth = 1.4; ctx.stroke(futEcl);
+    ctx.setLineDash([]);
     ctx.globalAlpha = 1;
   }
 

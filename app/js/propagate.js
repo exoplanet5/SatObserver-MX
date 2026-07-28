@@ -101,9 +101,11 @@
     let prev = null;
     for (let i = 0; i <= N; i++) {
       const ti = t0 + i * step;
-      const g = geodetic(sat, new Date(ti));
+      const di = new Date(ti);
+      const g = geodetic(sat, di);
       if (!g) { if (prev) { points.push(null); prev = null; } continue; }
-      const p = { t: ti, latDeg: g.latDeg, lonDeg: g.lonDeg, heightKm: g.heightKm };
+      const p = { t: ti, latDeg: g.latDeg, lonDeg: g.lonDeg, heightKm: g.heightKm,
+                  sunlit: U().satSunlit(g.eciPos, di) };
       if (prev && Math.abs(p.lonDeg - prev.lonDeg) > 180) points.push(null); // antimeridian
       points.push(p);
       prev = p;
