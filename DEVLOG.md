@@ -325,6 +325,26 @@ Greenwich).
     Debug note: a "frozen renderer" during testing was Chrome throttling
     rAF in an occluded tab — not an app bug; repaints resume on focus.
 
+15. **Milky Way flood fix + soft rendering** (2026-07-29) — user report:
+    deep-night sky sometimes washed out by a bright layer. Root cause: the
+    polar projection maps the nadir to the chart rim, so canvas even-odd
+    fills the side of each isophote ring *not* containing the nadir;
+    whenever the nadir drifted inside a contour (nightly — e.g. 12:00–17:00
+    UTC that evening, confirmed by an offline scan) the fill inverted and
+    painted the whole sky except the band (up to 3 levels ≈ 0.11 alpha
+    wash). Fix in `drawMW`: per-ring parity test — project the north
+    galactic pole (guaranteed outside every isophote) and if it lands
+    inside the ring's 2-D outline, append a rim-circle subpath to flip
+    even-odd parity back. Also added great-circle subdivision of long
+    projected chords (kills near-nadir distortion slashes) and a gentle
+    `ctx.filter` blur (~1% of R, feature-detected) so the stepped contours
+    read as one diffuse glow — Great Rift stays visible as a dimmer lane.
+    Verified by pixel histograms at 12:30/14:00/18:30/20:00 UTC: off-band
+    night sky exactly `#0a0e13`, band ≈ +13 luminance, twilight stage
+    colors intact. On user review the layer became its own toolbar toggle
+    (**MW**, `settings.skychart.mw`), **off by default** (was tied to the
+    star layer).
+
 ---
 
 ## 5. Phase 3 — standalone macOS app (2026-07-16)

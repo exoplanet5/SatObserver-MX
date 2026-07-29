@@ -24,6 +24,7 @@
     if (c.constLines == null) c.constLines = false;
     if (c.constNames == null) c.constNames = false;
     if (c.sunMoon == null) c.sunMoon = true;
+    if (c.mw == null) c.mw = false;             // Milky Way layer, off by default
     return c;
   }
 
@@ -288,31 +289,110 @@
     return { x: m.cx + sx * r * Math.sin(a), y: m.cy - r * Math.cos(a) };
   }
 
-  // faint Milky Way isophotes (d3-celestial contours), faded out in twilight
+  // faint Milky Way isophotes (d3-celestial contours), faded out in twilight.
+  // The polar projection maps the nadir to the chart rim, so canvas fills the
+  // side of each ring NOT containing the nadir; whenever the nadir drifts
+  // inside a contour that fill inverts and floods the whole sky. Each such
+  // ring gets an extra rim-circle subpath to flip even-odd parity back — the
+  // north galactic pole serves as a point known to be outside every isophote.
+  var MW_GP_RA = 192.859, MW_GP_DEC = 27.128; // north galactic pole (J2000)
+
+  function mwVecs(mw) {
+    return mw.levels.map(function (lev) {
+      return lev.rings.map(function (ring) {
+        var v = new Float64Array(ring.length * 3);
+        for (var i = 0; i < ring.length; i++) {
+          var ra = ring[i][0] * D2R, de = ring[i][1] * D2R, cd = Math.cos(de);
+          v[i * 3] = cd * Math.cos(ra);
+          v[i * 3 + 1] = cd * Math.sin(ra);
+          v[i * 3 + 2] = Math.sin(de);
+        }
+        return v;
+      });
+    });
+  }
+
+  function pointInPoly(px, py, pts) {
+    var inside = false;
+    for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      var yi = pts[i].y, yj = pts[j].y;
+      if ((yi > py) !== (yj > py) &&
+          px < (pts[j].x - pts[i].x) * (py - yi) / (yj - yi) + pts[i].x) inside = !inside;
+    }
+    return inside;
+  }
+
   function drawMW(m, loc, gmst, dark) {
     var mw = SAT.mwdata;
-    if (!mw || !cfg().stars || dark <= 0.02) return;
+    if (!mw || !cfg().mw || dark <= 0.02) return;
+    if (!mw._vecs) mw._vecs = mwVecs(mw);
     var lst = gmst + loc.lonDeg * D2R;
     var sinLat = Math.sin(loc.latDeg * D2R), cosLat = Math.cos(loc.latDeg * D2R);
+    var sinLst = Math.sin(lst), cosLst = Math.cos(lst);
+    var sx = cfg().eastLeft ? -1 : 1;
+    // equatorial unit vector -> chart point (same mapping as projectSky)
+    function pt(ux, uy, uz) {
+      var cH = cosLst * ux + sinLst * uy;   // cos(dec)·cos(H)
+      var sH = sinLst * ux - cosLst * uy;   // cos(dec)·sin(H)
+      var alt = Math.asin(Math.max(-1, Math.min(1, sinLat * uz + cosLat * cH)));
+      var az = Math.atan2(-sH, uz * cosLat - sinLat * cH);
+      var r = (90 - alt * R2D) / 90 * m.R;
+      return { x: m.cx + sx * r * Math.sin(az), y: m.cy - r * Math.cos(az) };
+    }
+    // edges get grossly distorted near the nadir singularity; subdivide long
+    // projected chords along the great circle so none can slash across the disc
+    var maxChord2 = (0.25 * m.R) * (0.25 * m.R);
+    function subdiv(out, x0, y0, z0, p0, x1, y1, z1, p1, depth) {
+      var dx = p1.x - p0.x, dy = p1.y - p0.y;
+      if (depth > 0 && dx * dx + dy * dy > maxChord2) {
+        var xm = x0 + x1, ym = y0 + y1, zm = z0 + z1;
+        var n = Math.sqrt(xm * xm + ym * ym + zm * zm);
+        if (n > 1e-9) {
+          xm /= n; ym /= n; zm /= n;
+          var pm = pt(xm, ym, zm);
+          subdiv(out, x0, y0, z0, p0, xm, ym, zm, pm, depth - 1);
+          subdiv(out, xm, ym, zm, pm, x1, y1, z1, p1, depth - 1);
+          return;
+        }
+      }
+      out.push(p1);
+    }
+    var gp = altAz(MW_GP_RA, MW_GP_DEC, lst, sinLat, cosLat);
+    var gpP = projectSky(gp.azDeg, gp.altDeg, m);
+    var RIM = m.R * 2.2;
     ctx.save();
     ctx.beginPath();
     ctx.arc(m.cx, m.cy, m.R, 0, Math.PI * 2);
     ctx.clip();
+    // soften the isophote steps into a diffuse glow where the browser allows
+    var blur = typeof ctx.filter === 'string';
+    if (blur) ctx.filter = 'blur(' + (m.R * 0.01).toFixed(1) + 'px)';
     for (var L = 0; L < mw.levels.length; L++) {
       var lev = mw.levels[L];
       ctx.beginPath();
       for (var ri = 0; ri < lev.rings.length; ri++) {
-        var ring = lev.rings[ri];
-        for (var i = 0; i < ring.length; i++) {
-          var a = altAz(ring[i][0], ring[i][1], lst, sinLat, cosLat);
-          var p = projectSky(a.azDeg, a.altDeg, m);
-          if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        var v = mw._vecs[L][ri];
+        var n = v.length / 3;
+        var p0 = pt(v[0], v[1], v[2]);
+        var pts = [p0];
+        for (var i = 1; i <= n; i++) {
+          var j = (i % n) * 3, k = ((i - 1) * 3);
+          var p1 = pt(v[j], v[j + 1], v[j + 2]);
+          subdiv(pts, v[k], v[k + 1], v[k + 2], p0, v[j], v[j + 1], v[j + 2], p1, 4);
+          p0 = p1;
         }
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (var q = 1; q < pts.length; q++) ctx.lineTo(pts[q].x, pts[q].y);
         ctx.closePath();
+        if (pointInPoly(gpP.x, gpP.y, pts)) {
+          ctx.moveTo(m.cx + RIM, m.cy);
+          ctx.arc(m.cx, m.cy, RIM, 0, Math.PI * 2);
+        }
       }
       ctx.fillStyle = 'rgba(172,192,222,' + (lev.a * dark).toFixed(3) + ')';
       ctx.fill('evenodd');
     }
+    if (blur) ctx.filter = 'none';
     ctx.restore();
   }
 
@@ -657,6 +737,7 @@
       toolBtns.constLines.classList.toggle('skc-on', !!c.constLines);
       toolBtns.constNames.classList.toggle('skc-on', !!c.constNames);
       toolBtns.sunMoon.classList.toggle('skc-on', !!c.sunMoon);
+      toolBtns.mw.classList.toggle('skc-on', !!c.mw);
     }
     body.appendChild(SAT.util.el('div', { class: 'skc-toolbar' }, [
       tbtn('grid', '30°', 'elevation grid spacing: 30° / 10° per ring', function () {
@@ -668,6 +749,7 @@
       }),
       tbtn('sunMoon', '☉', 'sun & moon (moon shows phase)', toggleLayer('sunMoon')),
       tbtn('stars', '✶', 'stars (to mag 4.6)', toggleLayer('stars')),
+      tbtn('mw', 'MW', 'Milky Way glow (fades out above sun alt −18°)', toggleLayer('mw')),
       tbtn('starNames', 'SN', 'bright star names', toggleLayer('starNames')),
       tbtn('constLines', 'CL', 'constellation lines', toggleLayer('constLines')),
       tbtn('constNames', 'CN', 'constellation names', toggleLayer('constNames')),

@@ -103,6 +103,8 @@ SAT.state.settings = {
             trackMinutesFwd:0 /*0 = auto: one period*/, labelSize:11 },
   globe3d:{ showStars:true, showNightLights:true, showTerminator:true },
   passes: { hours:24, minElevationDeg:10, visibleOnly:false },
+  skychart:{ eastLeft:true, elStep:30, stars:true, starNames:false, constLines:false,
+             constNames:false, sunMoon:true, mw:false /* Milky Way, off by default */ },
   layout: { <windowId>: {x,y,w,h,open} }   // maintained by SAT.windows
 }
 SAT.state.selection = { satId: null }

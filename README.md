@@ -204,8 +204,8 @@ window. In this mode data lives in `data\` next to `server.py`.
   E-left or map-view E-right). The sky disc tint steps automatically through
   five twilight stages (daylight · civil · nautical · astronomical · night,
   at sun altitudes 0/−6/−12/−18°) while the chart around it keeps the dark
-  theme, and a **faint Milky Way** (d3-celestial isophotes) appears in dark
-  skies. Satellites above the
+  theme, and an optional **faint Milky Way glow** (d3-celestial isophotes,
+  MW toggle, off by default) appears in dark skies. Satellites above the
   horizon are clickable; pass trajectories follow the GT toggle, are cut at
   a 1° rise/set threshold, show **Earth-shadow stretches dashed**,
   and carry per-minute time-boxed ticks with AOS/LOS times. Toggleable star
