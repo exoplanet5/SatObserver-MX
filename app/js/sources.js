@@ -78,9 +78,67 @@
       };
       const btn = U.el('button', { class: 'btn primary', onclick: () => go(false) }, 'Fetch');
       const btnR = U.el('button', { class: 'btn', title: 'Bypass 2 h cache', onclick: () => go(true) }, '⟳ Force refresh');
+
+      // single-object GP query (CATNR / INTDES / NAME on gp.php)
+      const qType = U.el('select', { class: 'select' }, [
+        U.el('option', { value: 'norad' }, 'NORAD IDs'),
+        U.el('option', { value: 'intldes' }, 'INTLDES / COSPAR'),
+        U.el('option', { value: 'name' }, 'Name contains'),
+      ]);
+      const Q_HINT = {
+        norad: '25544, 48274, … (≤20)',
+        intldes: '1998-067A or 98067A',
+        name: 'e.g. TIANHE',
+      };
+      const qVal = U.el('input', { class: 'input', placeholder: Q_HINT.norad, style: 'width:200px' });
+      qType.addEventListener('change', () => { qVal.placeholder = Q_HINT[qType.value] || ''; });
+      const goQ = async (refresh) => {
+        if (!qVal.value.trim() || qBtn.disabled) return;
+        busy(qBtn, status, 'Querying CelesTrak…');
+        qBtnR.disabled = true;
+        try {
+          const d = await api('/api/celestrak/query?type=' + qType.value +
+            '&value=' + encodeURIComponent(qVal.value.trim()) + (refresh ? '&refresh=1' : ''));
+          qBtn.disabled = false; qBtnR.disabled = false;
+          acceptPayload(d, status);
+        } catch (e) { fail(qBtn, status, e); qBtnR.disabled = false; }
+      };
+      qVal.addEventListener('keydown', e => { if (e.key === 'Enter') goQ(false); });
+      const qBtn = U.el('button', { class: 'btn primary', onclick: () => goQ(false) }, 'Fetch');
+      const qBtnR = U.el('button', { class: 'btn', title: 'Bypass 2 h cache', onclick: () => goQ(true) }, '⟳');
+
+      // full SATCAT snapshot (metadata for the info panel, not TLEs)
+      const scStatus = U.el('span', { class: 'dim', style: 'font-size:11px' }, '');
+      function scShow(d) {
+        scStatus.textContent = d.present
+          ? d.count.toLocaleString('en-US') + ' records on file · fetched ' +
+            (d.fetched || '').slice(0, 10) + (d.stale ? ' (stale — network failed)' : '')
+          : 'not downloaded yet — info panels look objects up one by one';
+      }
+      api('/api/satcat/full?status=1').then(scShow).catch(() => {});
+      const scBtn = U.el('button', {
+        class: 'btn small',
+        title: 'Download the complete CelesTrak satellite catalog (satcat.csv, ~7 MB) so ' +
+          'launch date/site and owner/type metadata works offline for every cataloged object',
+        onclick: async () => {
+          scBtn.disabled = true;
+          scStatus.textContent = 'downloading satcat.csv…';
+          try { scShow(await api('/api/satcat/full?refresh=1')); }
+          catch (e) { scStatus.textContent = '✗ ' + (e && e.message ? e.message : e); }
+          scBtn.disabled = false;
+        },
+      }, 'Fetch full SATCAT');
+
       panes['CelesTrak'].appendChild(U.el('div', null, [
         U.el('div', { class: 'row' }, [U.el('span', { class: 'dim' }, 'Group'), sel, btn, btnR]),
+        U.el('div', { class: 'row', style: 'margin-top:6px' },
+          [U.el('span', { class: 'dim' }, 'Object'), qType, qVal, qBtn, qBtnR]),
+        U.el('div', { class: 'dim', style: 'font-size:11px;margin-top:4px' },
+          'Object queries hit gp.php directly: CATNR (one request per NORAD id), ' +
+          'INTDES (whole launch; a piece letter narrows it), NAME (substring).'),
         status,
+        U.el('div', { class: 'sep' }),
+        U.el('div', { class: 'row' }, [scBtn, scStatus]),
       ]));
     }
 

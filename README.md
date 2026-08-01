@@ -142,8 +142,10 @@ window. In this mode data lives in `data\` next to `server.py`.
 
 ## Features
 
-- **TLE sources**: CelesTrak groups (stations, visual, Starlink, GPS, …),
-  **CelesTrak SupGP** supplemental data (see below),
+- **TLE sources**: CelesTrak groups (stations, visual, Starlink, GPS, …) plus
+  CelesTrak single-object queries (NORAD IDs / INTLDES / name search) and a
+  one-click **full SATCAT download** (~70k records, so launch/owner metadata in
+  the info panel works offline), **CelesTrak SupGP** supplemental data (see below),
   **Space-Track.org with your credentials** (NORAD IDs / INTLDES / name search /
   full catalog), Mike McCants zip links (classfd.zip, inttles.zip), paste-in
   TLEs. All fetches cached on disk (2 h freshness for CelesTrak; stale cache

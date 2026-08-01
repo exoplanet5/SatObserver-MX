@@ -7,6 +7,7 @@ persistence. Python 3.13 standard library only.
 """
 
 import argparse
+import csv
 import datetime
 import hashlib
 import math
@@ -57,10 +58,13 @@ PORT_TRIES = 11  # 8474..8484
 # JSON (OMM) format: NORAD_CAT_ID is a full integer, unlike 5-char TLE fields
 CELESTRAK_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=json"
 CELESTRAK_CATNR_URL = "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=json"
+CELESTRAK_INTDES_URL = "https://celestrak.org/NORAD/elements/gp.php?INTDES={intdes}&FORMAT=json"
+CELESTRAK_NAME_URL = "https://celestrak.org/NORAD/elements/gp.php?NAME={name}&FORMAT=json"
 SUPGP_URL = ("https://celestrak.org/NORAD/elements/supplemental/"
              "sup-gp.php?FILE={file}&FORMAT=json")
 SUPGP_INDEX_URL = "https://celestrak.org/NORAD/elements/supplemental/"
 SATCAT_URL = "https://celestrak.org/satcat/records.php?CATNR={norad}&FORMAT=JSON"
+SATCAT_FULL_URL = "https://celestrak.org/pub/satcat.csv"
 SATCAT_FRESH_S = 30 * 86400   # SATCAT records are near-static; refresh monthly
 SPACETRACK_BASE = "https://www.space-track.org"
 SPACETRACK_LOGIN = SPACETRACK_BASE + "/ajaxauth/login"
@@ -449,6 +453,60 @@ def cache_read(key):
         return None
 
 
+# Full-SATCAT snapshot (satcat.csv), kept on disk exactly as downloaded and
+# lazily indexed in memory as norad -> raw CSV line. Parsing all ~62k rows
+# into dicts up front would cost ~100 MB; raw lines are ~20 MB, and a single
+# line is csv-parsed only when its record is actually looked up.
+_SATCAT_FULL = {"mtime": None, "header": None, "rows": None}
+
+
+def satcat_full_table():
+    """The snapshot index, reloaded when the file on disk changes; None if
+    absent/unusable. File mtime doubles as the fetch time."""
+    p = CACHE_DIR / "satcat_full.csv"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return None
+    if _SATCAT_FULL["rows"] is None or _SATCAT_FULL["mtime"] != mtime:
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+        if not lines:
+            return None
+        header = next(csv.reader([lines[0]]))
+        try:
+            ncol = header.index("NORAD_CAT_ID")
+        except ValueError:
+            return None
+        rows = {}
+        for ln in lines[1:]:
+            try:
+                rows[str(int(next(csv.reader([ln]))[ncol]))] = ln
+            except (StopIteration, IndexError, ValueError):
+                continue
+        _SATCAT_FULL.update(mtime=mtime, header=header, rows=rows)
+    return {**_SATCAT_FULL,
+            "fetched": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                     time.gmtime(_SATCAT_FULL["mtime"]))}
+
+
+def satcat_full_record(norad):
+    """(record dict or None, snapshot mtime or None) for one object."""
+    t = satcat_full_table()
+    if not t:
+        return None, None
+    ln = t["rows"].get(str(norad))
+    if ln is None:
+        return None, t["mtime"]
+    try:
+        fields = next(csv.reader([ln]))
+    except StopIteration:
+        return None, t["mtime"]
+    return {k: v for k, v in zip(t["header"], fields) if v != ""}, t["mtime"]
+
+
 def load_config():
     try:
         cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -533,6 +591,46 @@ def spacetrack_query_url(qtype, value):
     raise ApiError(400, f"Unknown query type: {qtype!r}")
 
 
+def celestrak_query_urls(qtype, value):
+    """CelesTrak single-object GP query -> (url list, piece filter, label).
+
+    gp.php answers one CATNR per request, so a NORAD list becomes several
+    URLs; INTDES only takes the yyyy-nnn launch part, so a full COSPAR id
+    keeps its piece letters as a post-filter on OBJECT_ID.
+    """
+    v = value.strip()
+    if qtype == "norad":
+        parts = [s for s in re.split(r"[\s,]+", v) if s]
+        try:
+            ids = [str(int(s)) for s in parts]
+        except ValueError:
+            raise ApiError(400, "Invalid NORAD ID list (integers only)")
+        if not ids:
+            raise ApiError(400, "Empty NORAD ID list")
+        if len(ids) > 20:
+            raise ApiError(400, "CelesTrak answers one NORAD ID per request — "
+                                "20 max here; use Space-Track for large batches")
+        urls = [CELESTRAK_CATNR_URL.format(norad=i) for i in ids]
+        return urls, "", "catnr:" + ",".join(ids)
+    if qtype == "intldes":
+        u = v.upper()
+        m = re.match(r"^(\d{2})(\d{3})([A-Z]*)$", u)   # legacy TLE form 98067A
+        if m:
+            yy = int(m.group(1))
+            u = f"{1900 + yy if yy >= 57 else 2000 + yy}-{m.group(2)}{m.group(3)}"
+        m = re.match(r"^(\d{4}-\d{3})([A-Z]{0,3})$", u)
+        if not m:
+            raise ApiError(400, "INTDES must look like 1998-067A or 98067A")
+        url = CELESTRAK_INTDES_URL.format(intdes=m.group(1))
+        return [url], (u if m.group(2) else ""), "intdes:" + u
+    if qtype == "name":
+        if not v:
+            raise ApiError(400, "Empty name query")
+        url = CELESTRAK_NAME_URL.format(name=urllib.parse.quote(v, safe=""))
+        return [url], "", "name:" + v
+    raise ApiError(400, f"Unknown query type: {qtype!r}")
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -608,6 +706,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._respond(200, {"ok": True, "groups": groups})
             if path == "/api/celestrak/tle":
                 return self._celestrak_tle(qs)
+            if path == "/api/celestrak/query":
+                return self._celestrak_query(qs)
             if path == "/api/supgp/index":
                 return self._supgp_index(qs)
             if path == "/api/supgp/tle":
@@ -621,6 +721,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 })
             if path == "/api/satcat":
                 return self._satcat(qs)
+            if path == "/api/satcat/full":
+                return self._satcat_full(qs)
             if path == "/api/cache":
                 return self._cache_list()
             if path.startswith("/api/cache/"):
@@ -699,6 +801,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not tles:
             raise ApiError(502, f"CelesTrak returned no elements for group {group!r}")
         payload = make_payload(f"celestrak:{group}", tles)
+        cache_write(key, payload)
+        self._respond(200, payload)
+
+    def _celestrak_query(self, qs):
+        """Single-object GP lookup on CelesTrak: CATNR / INTDES / NAME."""
+        qtype = qs.get("type", "")
+        value = qs.get("value") or ""
+        refresh = qs.get("refresh") == "1"
+        urls, piece, label = celestrak_query_urls(qtype, value)
+        key = "celestrak_q_" + hashlib.sha1(
+            ("|".join(urls) + "|" + piece).encode("utf-8")).hexdigest()[:12]
+        cached = cache_read(key)
+        if (cached and not refresh
+                and time.time() - cached.get("fetchedUnix", 0) < CACHE_FRESH_S):
+            return self._respond(200, cached)
+        records, errors = [], []
+        for url in urls:
+            try:
+                raw = http_get(url)
+            except urllib.error.HTTPError as e:
+                if e.code != 404:   # 404 is gp.php for "no data for this query"
+                    errors.append(str(e))
+                continue
+            except Exception as e:
+                errors.append(str(e))
+                continue
+            try:
+                arr = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue  # "No GP data found" plain-text reply
+            if isinstance(arr, list):
+                records.extend(arr)
+        if not records and errors:
+            if cached:  # network failure -> serve stale copy
+                return self._respond(200, {**cached, "stale": True})
+            raise ApiError(502, f"CelesTrak fetch failed: {errors[0]}")
+        if piece:  # INTDES queried the whole launch; narrow to the piece
+            records = [r for r in records
+                       if str(r.get("OBJECT_ID") or "").strip().upper() == piece]
+        tles = omm_records_to_tles(records)
+        if not tles:
+            raise ApiError(404, f"CelesTrak has no GP data matching {label}")
+        payload = make_payload(f"celestrak:{label}", tles)
         cache_write(key, payload)
         self._respond(200, payload)
 
@@ -954,6 +1099,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ent = table.get(str(norad))
         if ent and time.time() - ent.get("fetched", 0) < SATCAT_FRESH_S:
             return self._respond(200, {"ok": True, "record": ent.get("record")})
+        # a fresh full-SATCAT snapshot answers locally; objects newer than
+        # the snapshot fall through to the per-object network fetch
+        rec, snap_mtime = satcat_full_record(norad)
+        if rec is not None and time.time() - snap_mtime < SATCAT_FRESH_S:
+            return self._respond(200, {"ok": True, "record": rec})
         try:
             raw = http_get(SATCAT_URL.format(norad=norad))
             arr = json.loads(raw.decode("utf-8", "replace"))
@@ -962,10 +1112,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if ent:  # network failure -> serve the stale record
                 return self._respond(200, {"ok": True, "record": ent.get("record"),
                                            "stale": True})
+            if rec is not None:  # ...or the stale snapshot
+                return self._respond(200, {"ok": True, "record": rec, "stale": True})
             raise ApiError(502, f"SATCAT fetch failed: {e}")
         table[str(norad)] = {"record": record, "fetched": time.time()}
         atomic_write(cache_file, json.dumps(table).encode("utf-8"))
         self._respond(200, {"ok": True, "record": record})
+
+    def _satcat_full(self, qs):
+        """Download/refresh the complete CelesTrak SATCAT (satcat.csv) so
+        metadata lookups work offline for every cataloged object; with
+        status=1 just report what is on file."""
+        t = satcat_full_table()
+        if qs.get("status") == "1":
+            return self._respond(200, {
+                "ok": True, "present": bool(t),
+                "count": len(t["rows"]) if t else 0,
+                "fetched": t["fetched"] if t else None,
+            })
+        refresh = qs.get("refresh") == "1"
+        if t and not refresh and time.time() - t["mtime"] < SATCAT_FRESH_S:
+            return self._respond(200, {"ok": True, "present": True,
+                                       "count": len(t["rows"]),
+                                       "fetched": t["fetched"]})
+        try:
+            raw = http_get(SATCAT_FULL_URL)
+        except Exception as e:
+            if t:  # network failure -> keep serving the stale snapshot
+                return self._respond(200, {"ok": True, "present": True,
+                                           "stale": True, "count": len(t["rows"]),
+                                           "fetched": t["fetched"]})
+            raise ApiError(502, f"SATCAT download failed: {e}")
+        if b"NORAD_CAT_ID" not in raw[:400]:
+            raise ApiError(502, "Unexpected SATCAT format (no NORAD_CAT_ID header)")
+        atomic_write(CACHE_DIR / "satcat_full.csv", raw)
+        _SATCAT_FULL["rows"] = None   # force re-index from the new file
+        t = satcat_full_table()
+        if not t or not t["rows"]:
+            raise ApiError(502, "Downloaded SATCAT could not be parsed")
+        self._respond(200, {"ok": True, "present": True,
+                            "count": len(t["rows"]), "fetched": t["fetched"]})
 
     # -- cache endpoints ----------------------------------------------------------
     @staticmethod

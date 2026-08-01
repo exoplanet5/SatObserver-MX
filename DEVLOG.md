@@ -345,6 +345,25 @@ Greenwich).
     (**MW**, `settings.skychart.mw`), **off by default** (was tied to the
     star layer).
 
+16. **CelesTrak object queries + full SATCAT** (2026-08-01) — the CelesTrak
+    tab gained a second query row mirroring the Space-Track one: single-object
+    GP lookups against `gp.php` by **NORAD IDs** (CATNR answers one id per
+    request, so lists loop server-side, capped at 20), **INTLDES / COSPAR**
+    (INTDES takes only the `yyyy-nnn` launch part — a piece letter narrows
+    the reply by OBJECT_ID; legacy `98067A` auto-converts) and **Name
+    contains** — new `GET /api/celestrak/query`, cached like other fetches;
+    gp.php signals "no match" with an HTTP 404, mapped to a clean message
+    instead of a fetch error. Plus a **Fetch full SATCAT** row:
+    `GET /api/satcat/full` downloads the complete `pub/satcat.csv` (~70k
+    records, 6.7 MB) into `data/cache/satcat_full.csv`, and `/api/satcat`
+    then answers info-panel metadata lookups from the local snapshot —
+    indexed lazily in memory as norad → raw CSV line (dict-parsing all rows
+    would cost ~100 MB; a line is csv-parsed only when its record is looked
+    up), falling through to the per-object network fetch for objects newer
+    than the snapshot and to stale data offline. Verified live: catnr /
+    intldes (98067A→ISS, 2021-035→Tianhe) / name queries all load correctly
+    from the UI, snapshot lookups answer in ~10 ms (Vanguard 1, NORAD 5).
+
 ---
 
 ## 5. Phase 3 — standalone macOS app (2026-07-16)

@@ -258,6 +258,13 @@ statics at `/` (correct MIME for html/css/js/jpg; `index.html` at `/`). JSON API
   parse 3-line TLE text -> `TlePayload`; disk-cache `data/cache/celestrak_<id>.json`;
   serve cache when fresh (<2 h) unless `refresh=1`; on network error, fall back to
   stale cache with `"stale":true`.
+- `GET /api/celestrak/query?type=norad|intldes|name&value=<v>[&refresh=1]` —
+  single-object GP lookups on `gp.php`: `norad` = comma/space list of ids (CATNR
+  answers one id per request, so ids loop server-side, ≤20 — Space-Track for big
+  batches); `intldes` = COSPAR (INTDES only takes the `yyyy-nnn` launch part, a
+  piece letter post-filters by OBJECT_ID; legacy `98067A` auto-converts);
+  `name` = substring. gp.php's HTTP 404 means "no match", not a fetch error.
+  Cache `data/cache/celestrak_q_<sha1[:12]>.json`, source `celestrak:<type>:<v>`.
 - `GET /api/supgp/index[?refresh=1]` -> `{ok, fetched, files:[{file,label,launch:bool}]}`
   — scrape `https://celestrak.org/NORAD/elements/supplemental/` for every
   `sup-gp.php?FILE=<name>` link. Stable operator files (iss, css, starlink, gps, …)
@@ -297,6 +304,13 @@ statics at `/` (correct MIME for html/css/js/jpg; `index.html` at `/`). JSON API
   unload-flush) -> save `data/state.json` (atomic write tmp+rename).
 - `GET /api/satcat?norad=N` -> `{ok, record}` — CelesTrak SATCAT record
   (LAUNCH_DATE, LAUNCH_SITE, OWNER, …) cached 30 d in `data/cache/satcat_map.json`.
+  A fresh full-SATCAT snapshot (below) answers first, locally; objects newer than
+  the snapshot fall through to the per-object fetch, stale data served offline.
+- `GET /api/satcat/full[?refresh=1 | ?status=1]` -> `{ok, present, count, fetched}`
+  — download the complete SATCAT (`https://celestrak.org/pub/satcat.csv`, ~70k
+  records / ~7 MB) to `data/cache/satcat_full.csv` (30 d freshness, `refresh=1`
+  forces); `status=1` only reports what is on file. Server keeps a lazy in-memory
+  index of norad -> raw CSV line (a record is csv-parsed only when looked up).
 
 `TlePayload = {ok:true, source:"celestrak:stations", fetched:"<iso>", count:N,
 tles:[{name, l1, l2, norad:int}]}`.
