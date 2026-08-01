@@ -90,7 +90,7 @@
         intldes: '1998-067A or 98067A',
         name: 'e.g. TIANHE',
       };
-      const qVal = U.el('input', { class: 'input', placeholder: Q_HINT.norad, style: 'width:200px' });
+      const qVal = U.el('input', { class: 'input', placeholder: Q_HINT.norad, style: 'width:140px' });
       qType.addEventListener('change', () => { qVal.placeholder = Q_HINT[qType.value] || ''; });
       const goQ = async (refresh) => {
         if (!qVal.value.trim() || qBtn.disabled) return;
