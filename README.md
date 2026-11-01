@@ -180,16 +180,27 @@ window. In this mode data lives in `data\` next to `server.py`.
 - **Click-to-select** in every view: clicking a satellite turns on its ground
   track, orbit, and footprint; clicking it again reverts it to label-only;
   selecting another satellite leaves the previous one's display as-is.
-- **2D Map**: NASA Blue Marble (terrain + bathymetry, no political borders),
-  pan/zoom, ground tracks (past dim / future bright; stretches where the
-  satellite is inside Earth's shadow are drawn dashed), footprint circles,
-  day/night terminator, graticule, sun/moon subpoints, ground stations,
-  live lat/lon/alt/vel + az/el/range readout.
-- **3D Globe**: textured Earth with night lights, satellites, orbits, ground
-  tracks (Earth-shadow stretches drawn faint), footprints, stations, stars,
-  sun-synchronized lighting; screen-constant labels and markers; **FS** mode
-  rides the nadir line of the selected satellite, looking straight down at
-  the ground it overflies.
+- **2D Map**: NASA Blue Marble Next Generation (September 2004, terrain +
+  bathymetry, no political borders) at the full **21600×10800** resolution
+  (~1.9 km/px), streamed as a tile pyramid so only the visible area at the
+  needed detail is loaded. The map spans **−360°…+360°**: the world repeats
+  half a turn on each side, so a view centred on the Pacific or the
+  antimeridian is continuous — imagery, ground tracks, footprints, night
+  shading, labels and all. Pan/zoom, ground tracks (past dim / future
+  bright; stretches where the satellite is inside Earth's shadow are drawn
+  dashed), footprint circles, day/night terminator, graticule, sun/moon
+  subpoints, ground stations, live lat/lon/alt/vel + az/el/range readout.
+- **3D Globe**: 8192×4096 Blue Marble texture; on the night side NASA's
+  **Black Marble 2016** (Suomi NPP VIIRS) city lights over moonlit terrain,
+  also 8192×4096 (NL toggle); a gold
+  **day/night terminator line** (TL toggle), satellites, orbits, ground
+  tracks (Earth-shadow stretches drawn faint), footprints, stations, and a
+  **real star field**: the 9,096 stars of the Yale Bright Star Catalogue
+  (to mag 6.5) with magnitude-scaled size and B−V colour, plus a soft
+  Milky Way glow, all turning with sidereal time and drawn at infinity
+  (✶ toggle). Sun-synchronized lighting; screen-constant labels and
+  markers; **FS** mode rides the nadir line of the selected satellite,
+  looking straight down at the ground it overflies.
 - **Master Clock**: free-running simulation clock, keyboard-editable
   `YYYY-MM-DD HH:MM:SS` (UTC) with per-segment ↑/↓ stepping
   (year/month/day/hour/min/sec), rate −1000×…+1000×, quick step buttons,
@@ -228,6 +239,9 @@ server.py            backend: static server + JSON API (Python stdlib only)
 desktop.py           native-window shell for the packaged app (pywebview)
 app/                 frontend (classic JS, no build step) + NASA imagery + vendor libs
 build_icon/          app icon generator (orthographic Blue Marble render)
+tools/               asset generators: make_basemap.py (Blue Marble tile pyramid,
+                     globe day + Black Marble night textures), make_starfield.py
+                     (BSC5 star catalog)
 release/             packaged apps (macOS arm64 zip, Windows x64 zip)
 docs/                screenshot
 .github/workflows/   Windows build automation (GitHub Actions)
@@ -240,11 +254,20 @@ SatObserver.command  double-click dev launcher
 
 - Space-Track credentials are stored (optionally) in the local data directory,
   chmod 600, plaintext — local machine only, never committed.
-- Base imagery: NASA Blue Marble Next Generation and NASA Earth Observatory
-  night lights (public domain).
-- Star & constellation catalog derived from
-  [d3-celestial](https://github.com/ofrohn/d3-celestial) (BSD-3; BSC5/HYG data).
-- Propagation: [satellite.js](https://github.com/shashwatak/satellite-js) (MIT);
+- Base imagery: NASA Blue Marble Next Generation (world.topo.bathy.200409,
+  21600×10800, NASA Visible Earth; public domain).
+- Night lights: NASA Black Marble 2016 colour map, 3 km (13500×6750) —
+  NASA Earth Observatory images by Joshua Stevens, using Suomi NPP VIIRS data
+  from Miguel Román, NASA's Goddard Space Flight Center (public domain).
+  Both source mosaics are rebuilt into the app's tiles/textures by
+  `tools/make_basemap.py`.
+- Sky chart star & constellation catalog derived from
+  [d3-celestial](https://github.com/ofrohn/d3-celestial) (BSD-3; BSC5/HYG data);
+  3D globe star field from the Yale Bright Star Catalogue, 5th rev. ed.
+  (Hoffleit & Warren 1991, CDS/ADC catalog V/50).
+- Propagation: [satellite.js](https://github.com/shashwatak/satellite-js) (MIT),
+  with a one-line patch that keeps the deep-space resonance integrator state
+  between calls (see `app/js/vendor/satellite.min.js` header);
   3D: [three.js](https://threejs.org) (MIT).
 - Orbital data: [CelesTrak](https://celestrak.org),
   [Space-Track](https://www.space-track.org), and Mike McCants' TLE archives.

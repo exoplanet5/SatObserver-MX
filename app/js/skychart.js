@@ -12,6 +12,12 @@
   var elHud = null, elFoot = null;
   var trackCache = new Map();  // satId -> {rec, aosMs, losMs, pts:[{t,az,el}], none:bool, computedAt}
   var MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  // Static sky (disc, Milky Way, grid, stars, constellations) is cached in an
+  // offscreen canvas, re-drawn only when sidereal time has turned by LST_Q —
+  // 0.05° moves a horizon star by ~0.3 px — or when a layer/site/size changes.
+  var LST_Q = 0.05 * Math.PI / 180;
+  var bgCv = null, bgCtx = null, bgKey = '';
+  var lastSimMs = NaN, lastWallMs = 0; // clock-driven redraw throttle
 
   function cfg() {
     var s = SAT.state.settings;
@@ -137,7 +143,10 @@
     var c = trackCache.get(sat.id);
     if (c && c.rec === sat._satrec) {
       if (c.none && Math.abs(nowMs - c.computedAt) < 60000) return c;
-      if (!c.none && nowMs >= c.aosMs - 300000 && nowMs <= c.losMs) return c;
+      // the pass found at computedAt stays "current or next" until its LOS;
+      // only stepping back before both computedAt and AOS can expose an
+      // earlier pass
+      if (!c.none && nowMs >= Math.min(c.computedAt, c.aosMs) && nowMs <= c.losMs) return c;
     }
     c = computeTrack(loc, sat, nowMs);
     trackCache.set(sat.id, c);
@@ -479,49 +488,69 @@
     ctx.fillText(text, x + 3, y);
   }
 
-  function drawTrajectory(m, loc, sat, nowMs) {
-    var tr = getTrack(loc, sat, nowMs);
-    if (tr.none || tr.pts.length < 2) return tr;
-    ctx.lineWidth = 1.6;
-    ctx.lineJoin = 'round';
-    var prev = null;
-    for (var i = 0; i < tr.pts.length; i++) {
-      var q = tr.pts[i];
-      var p = project(q.az, Math.max(q.el, RISE_EL), m);
-      if (prev) {
-        // eclipsed (Earth-shadow) stretches: dashed + dimmer
-        var ecl = q.sunlit === false;
-        ctx.strokeStyle = hexA(sat.color, (q.t <= nowMs ? 0.35 : 0.85) * (ecl ? 0.5 : 1));
-        ctx.setLineDash(ecl ? [3, 3] : []);
-        ctx.beginPath();
-        ctx.moveTo(prev.x, prev.y);
-        ctx.lineTo(p.x, p.y);
-        ctx.stroke();
-      }
-      prev = p;
-    }
-    ctx.setLineDash([]);
-    // time ticks along the track: per minute when the pass is short enough,
-    // else the smallest interval that keeps <=16 labels (long/GEO passes)
+  // time ticks along a cached pass: per minute when the pass is short enough,
+  // else the smallest interval that keeps <=16 labels (long/GEO passes)
+  function passTicks(loc, sat, tr) {
     var durMin = (tr.losMs - tr.aosMs) / 60000;
     var steps = [1, 2, 5, 10, 30, 60, 180, 360];
     var stepMin = 360;
     for (var si = 0; si < steps.length; si++) {
       if (durMin / steps[si] <= 16) { stepMin = steps[si]; break; }
     }
-    ctx.font = '9px ' + MONO;
+    var out = [];
     for (var tt = Math.ceil(tr.aosMs / 60000) * 60000; tt < tr.losMs; tt += stepMin * 60000) {
       var la = SAT.prop.lookAngles(loc, sat, new Date(tt));
-      if (!la || la.elDeg < RISE_EL) continue;
-      var pt = project(la.azDeg, la.elDeg, m);
+      if (la && la.elDeg >= RISE_EL) {
+        out.push({ az: la.azDeg, el: la.elDeg, label: SAT.util.fmtDate(new Date(tt)).slice(11, 16) });
+      }
+    }
+    return out;
+  }
+
+  function drawTrajectory(m, loc, sat, nowMs) {
+    var tr = getTrack(loc, sat, nowMs);
+    if (tr.none || tr.pts.length < 2) return tr;
+    // four stroke styles: past/future x sunlit/eclipsed (eclipsed = dashed,
+    // dimmer); consecutive samples of one style are chained into one path
+    var paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+    var prev = null, prevStyle = -1;
+    for (var i = 0; i < tr.pts.length; i++) {
+      var q = tr.pts[i];
+      var p = project(q.az, Math.max(q.el, RISE_EL), m);
+      if (prev) {
+        var style = (q.t <= nowMs ? 0 : 1) + (q.sunlit === false ? 2 : 0);
+        if (style !== prevStyle) paths[style].moveTo(prev.x, prev.y);
+        paths[style].lineTo(p.x, p.y);
+        prevStyle = style;
+      }
+      prev = p;
+    }
+    var alpha = [0.35, 0.85, 0.175, 0.425];
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = 'round';
+    for (var s = 0; s < 4; s++) {
+      ctx.strokeStyle = hexA(sat.color, alpha[s]);
+      ctx.setLineDash(s >= 2 ? [3, 3] : []);
+      ctx.stroke(paths[s]);
+    }
+    ctx.setLineDash([]);
+    if (!tr.ticks || tr.ticksColor !== sat.color) {
+      tr.ticks = passTicks(loc, sat, tr);
+      tr.ticksColor = sat.color;
+    }
+    ctx.font = '9px ' + MONO;
+    var tickFill = hexA(sat.color, 1);
+    for (var k = 0; k < tr.ticks.length; k++) {
+      var tk = tr.ticks[k];
+      var pt = project(tk.az, tk.el, m);
       ctx.beginPath();
       ctx.arc(pt.x, pt.y, 2.2, 0, Math.PI * 2);
-      ctx.fillStyle = hexA(sat.color, 1);
+      ctx.fillStyle = tickFill;
       ctx.fill();
       ctx.strokeStyle = 'rgba(8,10,14,0.9)';
       ctx.lineWidth = 1;
       ctx.stroke();
-      timeBox(SAT.util.fmtDate(new Date(tt)).slice(11, 16), pt.x + 5, pt.y - 5);
+      timeBox(tk.label, pt.x + 5, pt.y - 5);
     }
 
     // AOS / LOS markers at the 1-deg rise/set threshold
@@ -540,6 +569,8 @@
     var nowMs = date.getTime();
     var m = metrics();
     markerHits = [];
+    lastSimMs = nowMs;
+    lastWallMs = performance.now();
 
     var loc = SAT.state.activeLocation();
 
@@ -559,18 +590,40 @@
 
     var sunAlt = -90;
     try { sunAlt = SAT.util.sunAltitudeDeg(loc.latDeg, loc.lonDeg, date); } catch (e) { sunAlt = -90; }
-    // sky disc tinted by twilight stage (daylight → night, discrete steps)
-    ctx.beginPath();
-    ctx.arc(m.cx, m.cy, m.R, 0, Math.PI * 2);
-    ctx.fillStyle = skyBg(sunAlt);
-    ctx.fill();
-
-    var gmst = satellite.gstime(date);
     // Milky Way fades over twilight: full below sun alt -18°, gone above -6°
-    var mwDark = Math.max(0, Math.min(1, (-6 - sunAlt) / 12));
-    try { drawMW(m, loc, gmst, mwDark); } catch (e) { /* optional layer */ }
-    drawGrid(m);
-    try { drawStars(m, loc, gmst); } catch (e) { /* stars are optional */ }
+    var mwDark = Math.round(Math.max(0, Math.min(1, (-6 - sunAlt) / 12)) * 50) / 50;
+    var lstStep = Math.round((satellite.gstime(date) + loc.lonDeg * D2R) / LST_Q);
+    var c = cfg();
+    var key = [canvas.width, canvas.height, loc.latDeg, loc.lonDeg, c.eastLeft, c.elStep,
+               c.stars, c.starNames, c.constLines, c.constNames, c.mw, skyBg(sunAlt),
+               c.mw ? mwDark : 0, lstStep].join('|');
+    if (key !== bgKey) {
+      bgKey = key;
+      if (bgCv.width !== canvas.width || bgCv.height !== canvas.height) {
+        bgCv.width = canvas.width; bgCv.height = canvas.height;
+      }
+      var gmstQ = lstStep * LST_Q - loc.lonDeg * D2R;
+      var mainCtx = ctx;
+      ctx = bgCtx;                     // the layer painters draw on `ctx`
+      try {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.fillStyle = '#0a0e13';
+        ctx.fillRect(0, 0, cssW, cssH);
+        // sky disc tinted by twilight stage (daylight → night, discrete steps)
+        ctx.beginPath();
+        ctx.arc(m.cx, m.cy, m.R, 0, Math.PI * 2);
+        ctx.fillStyle = skyBg(sunAlt);
+        ctx.fill();
+        try { drawMW(m, loc, gmstQ, mwDark); } catch (e) { /* optional layer */ }
+        drawGrid(m);
+        try { drawStars(m, loc, gmstQ); } catch (e) { /* stars are optional */ }
+      } finally {
+        ctx = mainCtx;
+      }
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(bgCv, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     try { drawSunMoon(m, loc, date); } catch (e) { /* sun/moon are optional */ }
 
     var selId = SAT.state.selection ? SAT.state.selection.satId : null;
@@ -708,6 +761,8 @@
     canvas.className = 'skc-canvas';
     body.appendChild(canvas);
     ctx = canvas.getContext('2d');
+    bgCv = document.createElement('canvas');
+    bgCtx = bgCv.getContext('2d', { alpha: false });
 
     elHud = SAT.util.el('div', { class: 'skc-hud' }, '');
     elFoot = SAT.util.el('div', { class: 'skc-hud skc-foot' }, '');
@@ -777,9 +832,15 @@
     if (typeof ResizeObserver !== 'undefined') new ResizeObserver(resize).observe(body);
     resize();
 
+    // A LEO sat near the zenith sweeps up to ~1.5°/s; redraw once that would
+    // move a marker ~0.3 px on this chart, and at least 4x per second.
     SAT.bus.on('time', function (p) {
-      if (p && p.jumped) trackCache.clear();
-      requestRender();
+      if (p && p.jumped) { trackCache.clear(); requestRender(); return; }
+      var sim = p && p.date ? p.date.getTime() : SAT.clock.getDate().getTime();
+      var simStep = 0.3 / (1.5 * metrics().R / 90) * 1000;
+      if (!(Math.abs(sim - lastSimMs) < simStep) || performance.now() - lastWallMs >= 250) {
+        requestRender();
+      }
     });
     SAT.bus.on('sats-changed', function () { trackCache.clear(); requestRender(); });
     SAT.bus.on('selection-changed', requestRender);

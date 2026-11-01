@@ -258,8 +258,23 @@
     const TOGS = [['groundTrack', 'GT', 'ground track'], ['orbit', 'OR', 'orbit (3D globe)'],
                   ['footprint', 'FP', 'footprint'], ['label', 'LB', 'label']];
 
+    // a selection change (every click on a map) only moves the highlight:
+    // swap the class on two rows instead of rebuilding the whole tree
+    const rowById = new Map();
+    let selRowId = null;
+    function onSelectionChanged() {
+      const id = SAT.state.selection.satId;
+      const prev = selRowId && rowById.get(selRowId);
+      if (prev) prev.classList.remove('sel');
+      const cur = id && rowById.get(id);
+      if (cur) cur.classList.add('sel');
+      selRowId = id;
+    }
+
     function renderFamilies() {
       famHost.innerHTML = '';
+      rowById.clear();
+      selRowId = SAT.state.selection.satId;
       if (!SAT.state.families.length) {
         famHost.appendChild(U.el('div', { class: 'msg-empty' },
           'No satellites imported. Fetch TLEs in Sources, tick objects above, then Import.'));
@@ -371,6 +386,7 @@
           }, [sw, nm, U.el('span', { class: 'dim mono', style: 'font-size:10px' }, String(sat.norad)),
               badTle ? U.el('span', { class: 'tag warn', title: 'TLE could not be parsed/propagated — this object will not render' }, 'bad TLE') : null,
               U.el('span', { class: 'sat-togs' }, [infoBtn, togs]), del]);
+          rowById.set(sat.id, row);
           famEl.appendChild(row);
         });
         famHost.appendChild(famEl);
@@ -442,7 +458,7 @@
     let suppressFamilyRender = false;
     SAT.bus.on('catalog-changed', () => { selected.clear(); renderCatalog(); });
     SAT.bus.on('sats-changed', () => { if (!suppressFamilyRender) renderFamilies(); });
-    SAT.bus.on('selection-changed', renderFamilies);
+    SAT.bus.on('selection-changed', onSelectionChanged);
     SAT.bus.on('state-loaded', () => { rebuildFamSel(); renderCatalog(); renderFamilies(); applyImportFold(); });
     rebuildFamSel(); renderCatalog(); renderFamilies();
   }

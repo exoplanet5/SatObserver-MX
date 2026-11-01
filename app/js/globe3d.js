@@ -27,17 +27,22 @@
   var FOOT_N = 90;           // footprint samples requested
   var FOOT_CAP = 128;        // preallocated footprint vertices
   var ORBIT_N = 180;         // orbit samples per period
-  var STAR_COUNT = 2500;
-  var STAR_R = 60;
+  var TERM_R = 1.003;        // terminator ring radius (just above tracks)
+  var TERM_N = 256;
+  var DAY_TEX = 'assets/earth_day_8k.webp';   // Blue Marble NG Sept 2004, 8192x4096
+  var DAY_TEX_FALLBACK = 'assets/earth_day.jpg';
+  var NIGHT_TEX = 'assets/earth_night_8k.webp'; // Black Marble 2016 (VIIRS), 8192x4096
+  var NIGHT_TEX_FALLBACK = 'assets/earth_night.jpg';
   var CLICK_SLOP_PX = 5;
   var REF_DIST = 3.126;      // |HOME_POS|: label world-height is defined at this camera distance
 
   // ---------- module state ----------
   var bodyEl = null, winRef = null;
   var renderer = null, scene = null, camera = null, controls = null, raycaster = null;
-  var earthMesh, dayTex, nightTex, phongMat, nightMat, atmoMesh, stars;
-  var sunLight, ambientLight;
+  var earthMesh, dayTex, nightTex, phongMat, nightMat, atmoMesh, stars, milkyWay;
+  var sunLight, ambientLight, termLine;
   var eciGroup;                       // orbit lines live here; rotation.y = -gmst
+  var skyGroup;                       // stars + Milky Way, also rotated by -gmst
   var ringSprite;                     // selection highlight ring
   var markerGeo, pickGeo, coneGeo, pickMat;
   var satPool = new Map();            // satId -> entry
@@ -46,10 +51,14 @@
   var curDate = null, invRe = 1 / 6371.0;
   var selectedId = null, selScenePos = null;
   var pendingForce = false, needsFullUpdate = true, wasOpen = false;
-  var nightBtn, starsBtn, followBtn;
+  // render on demand: scene refresh when the clock moved enough, redraw when
+  // the scene or camera changed (an idle, paused globe costs nothing)
+  var timeDirty = false, needRender = true, lastUpdMs = NaN, lastUpdWall = 0;
+  var REBUILD_BUDGET_MS = 4, rebuildDeadline = 0;   // per-update orbit/track refresh budget
+  var nightBtn, termBtn, starsBtn, followBtn;
   var followOn = false;
   var pdX = null, pdY = null;
-  var HOME_POS = null;                // set in init (THREE not loaded yet here)
+  var HOME_POS = null, Y_AXIS = null; // set in init (THREE not loaded yet here)
   var sunDirVec = null;
   var tmpV = null, tmpV2 = null, mouseNdc = null;
 
@@ -139,7 +148,8 @@
   // ---------- settings ----------
   function gset() {
     var s = (SAT.state && SAT.state.settings && SAT.state.settings.globe3d) || {};
-    return { night: s.showNightLights !== false, stars: s.showStars !== false };
+    return { night: s.showNightLights !== false, stars: s.showStars !== false,
+             term: s.showTerminator !== false };
   }
 
   function writeSetting(key, val) {
@@ -156,17 +166,35 @@
   function applySettings() {
     var s = gset();
     if (nightBtn) nightBtn.classList.toggle('g3d-on', !!s.night);
+    if (termBtn) termBtn.classList.toggle('g3d-on', !!s.term);
     if (starsBtn) starsBtn.classList.toggle('g3d-on', !!s.stars);
     if (earthMesh) earthMesh.material = s.night ? nightMat : phongMat;
     if (stars) stars.visible = s.stars;
+    if (milkyWay) milkyWay.visible = s.stars;
+    if (termLine) termLine.visible = s.term;
     requestRender();
   }
 
   // ---------- scene construction ----------
+  // 8K WebP where the GPU takes it; the older, smaller JPEG otherwise (or if
+  // the WebP cannot be decoded)
+  function loadTex(loader, big, url, fallback) {
+    var tex = loader.load(big ? url : fallback, requestRender, undefined, function () {
+      if (!big) return;
+      new THREE.ImageLoader().load(fallback, function (img) {
+        tex.image = img;
+        tex.needsUpdate = true;
+        requestRender();
+      });
+    });
+    return tex;
+  }
+
   function buildEarth() {
     var loader = new THREE.TextureLoader();
-    dayTex = loader.load('assets/earth_day.jpg', requestRender);
-    nightTex = loader.load('assets/earth_night.jpg', requestRender);
+    var big = renderer.capabilities.maxTextureSize >= 8192;
+    dayTex = loadTex(loader, big, DAY_TEX, DAY_TEX_FALLBACK);
+    nightTex = loadTex(loader, big, NIGHT_TEX, NIGHT_TEX_FALLBACK);
     var maxAniso = renderer.capabilities.getMaxAnisotropy();
     [dayTex, nightTex].forEach(function (t) {
       t.encoding = THREE.sRGBEncoding;   // WebGL2: hardware decode -> linear samples
@@ -204,7 +232,12 @@
         '  float d = dot(normalize(vNormalW), sunDir);',
         '  float k = smoothstep(-0.05, 0.05, d);', // ~0.1-wide twilight band
         '  vec3 day = texture2D(dayMap, vUv).rgb * (0.16 + 0.98 * clamp(d, 0.0, 1.0));',
-        '  vec3 night = texture2D(nightMap, vUv).rgb * vec3(1.05, 0.95, 0.78);',
+        // Black Marble colours are natural already (warm lights, moonlit
+        // navy terrain): lift the lights (~2x linear) so cities read at globe
+        // scale, but keep the faint terrain near its own dark level
+        '  vec3 n = texture2D(nightMap, vUv).rgb;',
+        '  float L = max(n.r, max(n.g, n.b));',
+        '  vec3 night = n * mix(0.85, 2.2, smoothstep(0.03, 0.35, L));',
         '  vec3 col = mix(night, day, k);',
         // samples were hardware-decoded to linear; manually re-encode to sRGB
         // (ShaderMaterial output is not auto-encoded by the renderer)
@@ -243,25 +276,207 @@
     scene.add(atmoMesh);
   }
 
+  // ---------- sky: real stars + Milky Way, fixed in the inertial frame ----------
+  // Both live in skyGroup (rotation.y = -gmst, like the orbit lines) and are
+  // drawn at infinity: the vertex shaders apply only the camera ROTATION, so
+  // orbiting the globe never shifts the stars against each other. RA/Dec map
+  // to the scene exactly like lon/lat (geoToScene) since ECI is the sky frame.
+  var SKY_VS_HEAD = 'vec4 skyPos(vec3 dir, float r) {' +
+    '  return projectionMatrix * vec4(mat3(viewMatrix) * (mat3(modelMatrix) * dir) * r, 1.0);' +
+    '}\n';
+
+  // B-V colour index -> display RGB: Ballesteros (2012) temperature, then a
+  // blackbody fit (T. Helland), pulled 45% toward white — stars look tinted,
+  // not painted.
+  function bvToRgb(bv) {
+    var T = 4600 * (1 / (0.92 * bv + 1.7) + 1 / (0.92 * bv + 0.62));
+    var t = T / 100, r, g, b;
+    r = t <= 66 ? 255 : 329.698727446 * Math.pow(t - 60, -0.1332047592);
+    g = t <= 66 ? 99.4708025861 * Math.log(t) - 161.1195681661
+                : 288.1221695283 * Math.pow(t - 60, -0.0755148492);
+    b = t >= 66 ? 255 : (t <= 19 ? 0 : 138.5177312231 * Math.log(t - 10) - 305.0447927307);
+    var c = [r, g, b].map(function (v) { return Math.max(0, Math.min(255, v)) / 255; });
+    var mx = Math.max(c[0], c[1], c[2]) || 1;
+    return c.map(function (v) { return 0.45 + 0.55 * v / mx; });
+  }
+
   function buildStars() {
-    var pos = new Float32Array(STAR_COUNT * 3);
-    for (var i = 0; i < STAR_COUNT; i++) {
-      var z = Math.random() * 2 - 1;               // uniform on sphere
-      var t = Math.random() * Math.PI * 2;
-      var r = Math.sqrt(Math.max(0, 1 - z * z));
-      pos[i * 3] = STAR_R * r * Math.cos(t);
-      pos[i * 3 + 1] = STAR_R * z;
-      pos[i * 3 + 2] = STAR_R * r * Math.sin(t);
+    var cat = SAT.bsc5;
+    if (!cat || !cat.data) return;
+    var bin = atob(cat.data), n = cat.n;
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    var dv = new DataView(bytes.buffer);
+    var pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+    var size = new Float32Array(n), v3 = new THREE.Vector3();
+    for (i = 0; i < n; i++) {
+      var ra = dv.getUint16(i * 8, true) / 100, de = dv.getInt16(i * 8 + 2, true) / 100;
+      var V = dv.getInt16(i * 8 + 4, true) / 100, bvRaw = dv.getInt16(i * 8 + 6, true);
+      geoToScene(de, ra, 1, v3);
+      pos[i * 3] = v3.x; pos[i * 3 + 1] = v3.y; pos[i * 3 + 2] = v3.z;
+      // brightness linear in magnitude (log flux), sprite size likewise
+      var k = Math.max(0.25, Math.min(1, 0.25 + 0.75 * (6.8 - V) / 6.3));
+      var c = bvToRgb(bvRaw === -32768 ? 0.65 : bvRaw / 1000);
+      col[i * 3] = c[0] * k; col[i * 3 + 1] = c[1] * k; col[i * 3 + 2] = c[2] * k;
+      size[i] = Math.max(2.2, Math.min(7.5, 2.2 + 0.6 * (6.5 - V)));
     }
     var g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    stars = new THREE.Points(g, new THREE.PointsMaterial({
-      color: srgbColor('#c8d4e6'), size: 1.4, sizeAttenuation: false,
-      transparent: true, opacity: 0.85, depthWrite: false
+    g.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+    g.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+    stars = new THREE.Points(g, new THREE.ShaderMaterial({
+      uniforms: { uScale: { value: renderer.getPixelRatio() } },
+      vertexShader: SKY_VS_HEAD + [
+        'attribute vec3 aColor;',
+        'attribute float aSize;',
+        'uniform float uScale;',
+        'varying vec3 vColor;',
+        'void main() {',
+        '  vColor = aColor;',
+        '  gl_Position = skyPos(position, 100.0);',
+        '  gl_PointSize = aSize * uScale;',
+        '}'
+      ].join('\n'),
+      fragmentShader: [
+        'varying vec3 vColor;',
+        'void main() {',
+        '  vec2 d = gl_PointCoord - 0.5;',
+        '  float a = exp(-dot(d, d) * 16.0);',    // soft round PSF
+        '  gl_FragColor = vec4(vColor, a);',
+        '}'
+      ].join('\n'),
+      blending: THREE.AdditiveBlending, transparent: true, depthWrite: false
     }));
     stars.frustumCulled = false;
+    stars.renderOrder = -1;
     stars.visible = gset().stars;
-    scene.add(stars);
+    skyGroup.add(stars);
+  }
+
+  // Milky Way: the d3-celestial isophotes (SAT.mwdata, RA/Dec rings) painted
+  // into an equirectangular texture, softened, and mapped on a sphere at
+  // infinity — same RA/Dec <-> UV layout as the Earth texture's lon/lat.
+  function mwTexture() {
+    var mw = SAT.mwdata;
+    if (!mw || !mw.levels) return null;
+    var W = 1024, H = 512;
+    var cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    var c = cv.getContext('2d');
+    c.fillStyle = '#000';
+    c.fillRect(0, 0, W, H);
+    c.globalCompositeOperation = 'lighter';
+    function X(ra) { return (ra + 180) / 360 * W; }
+    function Y(de) { return (90 - de) / 180 * H; }
+    // north galactic pole: outside every isophote, so its even-odd parity
+    // must come out "outside" — a level whose rings say otherwise is flipped
+    var gpx = X(192.859 - 360), gpy = Y(27.128);
+    mw.levels.forEach(function (lev) {
+      var path = new Path2D(), inside = false;
+      lev.rings.forEach(function (ring) {
+        // unwrap RA along the ring; a ring circling a celestial pole winds
+        // once (net +-360) and is closed along the top edge instead
+        var pts = [], prev = null;
+        ring.forEach(function (p) {
+          var ra = p[0];
+          if (prev !== null) {
+            while (ra - prev > 180) ra -= 360;
+            while (ra - prev < -180) ra += 360;
+          }
+          pts.push([ra, p[1]]);
+          prev = ra;
+        });
+        var close = pts[0][0] - prev;
+        while (close > 180) close -= 360;
+        while (close < -180) close += 360;
+        var wind = Math.round((prev + close - pts[0][0]) / 360);
+        for (var k = -1; k <= 1; k++) {
+          var poly = pts.map(function (q) { return [X(q[0] + 360 * k), Y(q[1])]; });
+          if (wind) {
+            var endX = X(pts[0][0] + 360 * wind + 360 * k);
+            poly.push([endX, Y(pts[0][1])], [endX, -4], [poly[0][0], -4]);
+          }
+          path.moveTo(poly[0][0], poly[0][1]);
+          for (var j = 1; j < poly.length; j++) path.lineTo(poly[j][0], poly[j][1]);
+          path.closePath();
+          // even-odd parity of the galactic pole against this polygon
+          for (var a = 0, b = poly.length - 1; a < poly.length; b = a++) {
+            if ((poly[a][1] > gpy) !== (poly[b][1] > gpy) &&
+                gpx < (poly[b][0] - poly[a][0]) * (gpy - poly[a][1]) /
+                      (poly[b][1] - poly[a][1]) + poly[a][0]) inside = !inside;
+          }
+        }
+      });
+      if (inside) path.rect(-8, -8, W + 16, H + 16);
+      c.fillStyle = 'rgba(255,255,255,' + Math.min(1, lev.a * 4.0).toFixed(3) + ')';
+      c.fill(path, 'evenodd');
+    });
+    // soften the contour steps into a diffuse glow (~2°): a real blur where
+    // the canvas supports filters, else a 4x down- and up-sample
+    var sm = document.createElement('canvas');
+    var sc = sm.getContext('2d');
+    if (typeof sc.filter === 'string') {
+      sm.width = W; sm.height = H;
+      sc.filter = 'blur(6px)';
+      sc.drawImage(cv, 0, 0);
+    } else {
+      sm.width = W / 4; sm.height = H / 4;
+      sc.imageSmoothingQuality = 'high';
+      sc.drawImage(cv, 0, 0, sm.width, sm.height);
+    }
+    c.globalCompositeOperation = 'copy';
+    c.imageSmoothingQuality = 'high';
+    c.drawImage(sm, 0, 0, W, H);
+    var tex = new THREE.CanvasTexture(cv);
+    tex.minFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    return tex;
+  }
+
+  function buildMilkyWay() {
+    var tex = mwTexture();
+    if (!tex) return;
+    milkyWay = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), new THREE.ShaderMaterial({
+      uniforms: { map: { value: tex }, uGain: { value: 0.42 } },
+      vertexShader: SKY_VS_HEAD + [
+        'varying vec2 vUv;',
+        'void main() { vUv = uv; gl_Position = skyPos(position, 150.0); }'
+      ].join('\n'),
+      fragmentShader: [
+        'uniform sampler2D map;',
+        'uniform float uGain;',
+        'varying vec2 vUv;',
+        'void main() {',
+        '  float v = texture2D(map, vUv).r;',
+        '  gl_FragColor = vec4(vec3(0.60, 0.68, 0.86) * v * uGain, 1.0);',
+        '}'
+      ].join('\n'),
+      side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+      transparent: true, depthWrite: false
+    }));
+    milkyWay.frustumCulled = false;
+    milkyWay.renderOrder = -2;
+    milkyWay.visible = gset().stars;
+    skyGroup.add(milkyWay);
+  }
+
+  // Day/night terminator: a great circle normal to the sun direction, built
+  // once in the XZ plane and turned toward the sun every update.
+  function buildTerminator() {
+    var pos = new Float32Array(TERM_N * 3);
+    for (var i = 0; i < TERM_N; i++) {
+      var a = i / TERM_N * Math.PI * 2;
+      pos[i * 3] = Math.cos(a) * TERM_R;
+      pos[i * 3 + 2] = Math.sin(a) * TERM_R;
+    }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    termLine = new THREE.LineLoop(g, new THREE.LineBasicMaterial({
+      color: srgbColor('#ffd54f'), transparent: true, opacity: 0.75, depthWrite: false
+    }));
+    termLine.frustumCulled = false;
+    termLine.visible = gset().term;
+    scene.add(termLine);
   }
 
   function buildLights() {
@@ -304,6 +519,7 @@
     geoToScene(sp.latDeg, sp.lonDeg, 1, sunDirVec).normalize();
     sunLight.position.copy(sunDirVec).multiplyScalar(8);
     nightMat.uniforms.sunDir.value.copy(sunDirVec);
+    termLine.quaternion.setFromUnitVectors(Y_AXIS, sunDirVec);
   }
 
   // ---------- satellite pool ----------
@@ -431,13 +647,20 @@
     if (old) old.dispose();
   }
 
-  function rebuildLines(e, nowMs) {
+  // Only the lines actually shown are sampled (a label-only sat costs no
+  // SGP4 runs here); wantOrbit/wantTrack are remembered so turning a toggle
+  // on later triggers a build.
+  function rebuildLines(e, nowMs, wantOrbit, wantTrack) {
     e.builtMs = nowMs;
+    e.builtOrbit = wantOrbit;
+    e.builtTrack = wantTrack;
 
     // Orbit: ECI samples mapped with the axis swap only; the parent eciGroup's
     // rotation.y = -gmst performs the rigid ECI->ECEF rotation every tick.
     var pts = null;
-    try { pts = SAT.prop.orbitEci(e.sat, curDate, ORBIT_N); } catch (err) { pts = null; }
+    if (wantOrbit) {
+      try { pts = SAT.prop.orbitEci(e.sat, curDate, ORBIT_N); } catch (err) { pts = null; }
+    }
     e.orbitCount = 0;
     if (pts && pts.length > 1) {
       var arr = new Float32Array(pts.length * 3);
@@ -454,10 +677,12 @@
       e.orbitCount = n;
     }
 
-    // Ground track: surface polyline in the ECEF/scene frame, broken at nulls
-    // (antimeridian splits) by emitting independent segments.
+    // Ground track: surface polyline in the ECEF/scene frame as independent
+    // segments; a null sample (propagation gap) breaks it.
     var gt = null;
-    try { gt = SAT.prop.groundTrack(e.sat, curDate, 0, 0); } catch (err) { gt = null; }
+    if (wantTrack) {
+      try { gt = SAT.prop.groundTrack(e.sat, curDate, 0, 0); } catch (err) { gt = null; }
+    }
     e.trackCount = 0;
     e.trackDimCount = 0;
     var tp = gt && gt.points;
@@ -520,10 +745,17 @@
     if (wantFoot) updateFootprint(e, g);
     e.foot.visible = wantFoot && e.footCount > 2;
 
-    if (force || Math.abs(nowMs - e.builtMs) > e.periodMs / 8) rebuildLines(e, nowMs);
-    e.orbit.visible = show.orbit !== false && e.orbitCount > 1;
-    e.track.visible = show.groundTrack !== false && e.trackCount > 1;
-    e.trackDim.visible = show.groundTrack !== false && e.trackDimCount > 1;
+    var wantOrbit = show.orbit !== false, wantTrack = show.groundTrack !== false;
+    if (force || e.builtOrbit !== wantOrbit || e.builtTrack !== wantTrack) {
+      rebuildLines(e, nowMs, wantOrbit, wantTrack);
+    } else if ((wantOrbit || wantTrack) && Math.abs(nowMs - e.builtMs) > e.periodMs / 8) {
+      // routine refresh: lines drift slowly, so past the frame's time budget
+      // they wait for the next update instead of piling into one long frame
+      if (performance.now() < rebuildDeadline) rebuildLines(e, nowMs, wantOrbit, wantTrack);
+    }
+    e.orbit.visible = wantOrbit && e.orbitCount > 1;
+    e.track.visible = wantTrack && e.trackCount > 1;
+    e.trackDim.visible = wantTrack && e.trackDimCount > 1;
   }
 
   function updateSelectionVisuals() {
@@ -548,8 +780,10 @@
     var gmst;
     try { gmst = satellite.gstime(curDate); } catch (e) { return; }
     eciGroup.rotation.y = -gmst;
+    skyGroup.rotation.y = -gmst;
     updateSun();
     var nowMs = curDate.getTime();
+    rebuildDeadline = performance.now() + REBUILD_BUDGET_MS;
     satPool.forEach(function (e) { updateSatEntry(e, nowMs, force); });
     updateSelectionVisuals();
   }
@@ -557,12 +791,27 @@
   function doUpdate() {
     var f = pendingForce;
     pendingForce = false;
+    timeDirty = false;
     updateScene(f);
+    lastUpdMs = curDate ? curDate.getTime() : NaN;
+    lastUpdWall = performance.now();
+    needRender = true;
   }
 
+  // the next frame refreshes the scene (frame() skips all work while closed)
   function kick() {
-    if (winRef && winRef.isOpen()) doUpdate();
-    else needsFullUpdate = true;
+    needsFullUpdate = true;
+  }
+
+  // Sim time that moves the fastest LEO sat (~7.8 km/s) by ~0.3 px at the
+  // current zoom; clock ticks closer together than this skip the (SGP4-heavy)
+  // scene refresh. Follow mode rides the satellite: refresh every tick.
+  function simStepMs() {
+    if (followOn) return 0;
+    var surf = Math.max(camera.position.length() - 1, 0.02);
+    var kmPerPx = 6371 * 2 * surf * Math.tan(camera.fov * Math.PI / 360) /
+                  Math.max(1, bodyEl.clientHeight);
+    return 0.3 * kmPerPx / 7.8 * 1000;
   }
 
   // ---------- stations ----------
@@ -651,7 +900,10 @@
     nightBtn = tbtn('NL', 'night lights', function () {
       writeSetting('showNightLights', !gset().night);
     });
-    starsBtn = tbtn('✶', 'stars', function () {
+    termBtn = tbtn('TL', 'terminator line (day/night boundary)', function () {
+      writeSetting('showTerminator', !gset().term);
+    });
+    starsBtn = tbtn('✶', 'stars (Yale Bright Star Catalogue, to mag 6.5) and Milky Way', function () {
       writeSetting('showStars', !gset().stars);
     });
     followBtn = tbtn('FS', 'follow selected satellite', function () {
@@ -680,6 +932,7 @@
     renderer.setSize(w, h, false);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
+    needRender = true;
   }
 
   // Labels AND markers keep a constant on-screen size: world scale grows with
@@ -732,16 +985,23 @@
     if (needsFullUpdate) {
       needsFullUpdate = false;
       doUpdate();
+    } else if (timeDirty) {
+      var ms = curDate ? curDate.getTime() : NaN;
+      if (pendingForce || !(Math.abs(ms - lastUpdMs) < simStepMs()) ||
+          performance.now() - lastUpdWall >= 250) doUpdate();
     }
     if (followOn && selScenePos) {
       // nadir view: camera rides directly above the selected sat, looking
       // straight down through it at the Earth (zoom still works)
       var dist = Math.max(camera.position.length(), 1.06);
       tmpV.copy(selScenePos).normalize().multiplyScalar(dist);
+      if (camera.position.distanceToSquared(tmpV) > 1e-12) needRender = true;
       camera.position.lerp(tmpV, 0.2);
       controls.target.set(0, 0, 0);
     }
-    controls.update();
+    if (controls.update()) needRender = true;   // damping still settling
+    if (!needRender) return;
+    needRender = false;
     rescaleScreenItems();
     renderer.render(scene, camera);
   }
@@ -750,7 +1010,7 @@
   function onTime(payload) {
     if (payload && payload.date) curDate = payload.date;
     if (payload && payload.jumped) pendingForce = true;
-    kick();
+    timeDirty = true;
   }
 
   function onSatsChanged() {
@@ -797,6 +1057,7 @@
 
     invRe = 1 / SAT.prop.Re;
     HOME_POS = new THREE.Vector3(2.2, 1.3, 1.8);
+    Y_AXIS = new THREE.Vector3(0, 1, 0);
     sunDirVec = new THREE.Vector3(1, 0, 0);
     tmpV = new THREE.Vector3();
     tmpV2 = new THREE.Vector3();
@@ -829,11 +1090,15 @@
     controls.zoomSpeed = 0.6;
     controls.rotateSpeed = 0.55;
     controls.enablePan = false;
+    // pointer handlers and resetView() run controls.update() themselves
+    controls.addEventListener('change', function () { needRender = true; });
 
     raycaster = new THREE.Raycaster();
 
     eciGroup = new THREE.Group();
     scene.add(eciGroup);
+    skyGroup = new THREE.Group();
+    scene.add(skyGroup);
 
     markerGeo = new THREE.SphereGeometry(MARKER_R, 10, 8);
     pickGeo = new THREE.SphereGeometry(PICK_R, 8, 6);
@@ -842,6 +1107,8 @@
 
     buildEarth();
     buildStars();
+    buildMilkyWay();
+    buildTerminator();
     buildLights();
     buildRingSprite();
     applySettings();

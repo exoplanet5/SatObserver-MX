@@ -364,6 +364,58 @@ Greenwich).
     intldes (98067A→ISS, 2021-035→Tianhe) / name queries all load correctly
     from the UI, snapshot lookups answer in ~10 ms (Vanguard 1, NORAD 5).
 
+17. **Performance review + imagery/star-field upgrade** (2026-11-02).
+    *Measured first* (headless Chrome via CDP on an M1 Max, all three views
+    open, a 254-sat McCants family with 220 orbits / 20 tracks+footprints):
+    **4.5 fps at 1×, 1.4 fps at 100×** — 218 ms of JS per frame. Findings,
+    in order of impact:
+    (a) **satellite.js 5.0 discards the deep-space resonance integrator
+    state** (`atime/xli/xni`), so every `propagate()` of a GEO/Molniya object
+    re-integrated from the TLE epoch in 720-min steps — 194 µs per call vs
+    1.6 µs for LEO with this set's 609-day median elset age; 92% of all CPU.
+    One-line vendor patch writes the state back (as Vallado's C++ does) and
+    `propagate.js` checkpoints it per satrec so backward time jumps resume
+    from the nearest earlier state; verified **bit-identical** to fresh
+    from-epoch integration over 17,080 random-order calls on 56 resonant sats.
+    (b) Sky-chart pass cache only hit within 5 min of AOS, so every sat with
+    a later pass re-scanned up to 12 h of SGP4 *every frame*; now valid from
+    min(computedAt, AOS) to LOS. (c) Per-frame `geodetic()` memo (three views
+    asked for the same instant), ground-track cache keyed by window length.
+    (d) Globe: render on demand (idle/paused = zero GPU work), zoom-aware
+    scene-refresh throttle, orbit/track lines sampled only when shown, routine
+    rebuilds under a 4 ms budget (was a 93 ms spike at 1000× when 220 orbits
+    expired together). (e) 2D map and sky chart: clock-driven redraws only when
+    something moves ≥0.3 px (≥4 Hz for readouts); sky chart caches its static
+    background per 0.05° of sidereal time and batches trajectory strokes.
+    (f) Clock UI and map HUD skip unchanged DOM writes; the Satellites window
+    swaps one CSS class on selection instead of rebuilding the whole tree;
+    server cache listing reads metadata from file heads (0.4 vs 18 ms for a
+    30k-object catalog). **Result: 60 fps at 1×/100×/1000×, 0.5–0.8 ms JS per
+    frame at 1× (3–5% main-thread busy), worst frame 15 ms at 1000×.**
+    *2D map*: Blue Marble NG **Sept 2004 at full 21600×10800** (was Dec 2004,
+    5400×2700) as a WebP tile pyramid (`tools/make_basemap.py`, 4 levels,
+    170 tiles, 18 MB) with off-thread decode, LRU and an offscreen composite;
+    drawable domain **−360°…+360°** with every layer drawn in each visible
+    world copy — `groundTrack` no longer splits at the antimeridian (the map
+    unwraps; this also closed a one-sample gap in globe tracks at ±180°).
+    Verified: no tile seams, Pacific-centred view continuous, ~33× zoom shows
+    level-3 detail. *3D globe*: 8192×4096 WebP texture of the same mosaic;
+    gold **terminator line** (TL, `settings.globe3d.showTerminator`, which
+    existed in the state schema but was never drawn); **real star field** —
+    9,096 BSC5 stars (`tools/make_starfield.py`, 95 KB packed) with
+    magnitude-scaled PSF sprites and B−V colours, plus a blurred Milky Way
+    texture painted from the isophotes (galactic-pole parity check as in the
+    sky chart), both at infinity and turning with GMST. Orientation verified
+    numerically: Spica/Antares/Arcturus/Vega separations from the scene's sun
+    direction match the catalogue to 0.01°.
+    On user review: globe night lights replaced by **NASA Black Marble 2016**
+    (3 km colour map, 13500×6750, downloaded from NASA Earth Observatory into
+    ~/sda/basemaps next to the Blue Marble source) as an 8192×4096 WebP
+    (q90, 1.4 MB; old 2400×1200 JPEG kept as fallback). Its colours are
+    natural, so the old warm tint is gone; a luminance-dependent gain lifts
+    city lights ~2× (linear) while the moonlit navy terrain stays dark —
+    a flat gain washed the land out to lavender.
+
 ---
 
 ## 5. Phase 3 — standalone macOS app (2026-07-16)

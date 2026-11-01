@@ -102,6 +102,7 @@ MIME_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".jpg": "image/jpeg",
+    ".webp": "image/webp",
     ".png": "image/png",
     ".json": "application/json; charset=utf-8",
     ".ico": "image/x-icon",
@@ -443,6 +444,34 @@ def cache_path(key):
 
 def cache_write(key, payload):
     atomic_write(cache_path(key), json.dumps(payload).encode("utf-8"))
+
+
+_CACHE_HEAD_RE = re.compile(
+    r'^\{"ok": true, "source": ("(?:[^"\\]|\\.)*"), "fetched": ("(?:[^"\\]|\\.)*"), '
+    r'"fetchedUnix": [-0-9.eE+]+, "count": (\d+), "tles": \[')
+
+
+def cache_meta(p):
+    """{source, fetched, count} of a cached TLE payload, read from the first
+    few hundred bytes — make_payload's key order puts them ahead of the
+    (possibly multi-MB) element list. Anything else gets a full parse."""
+    try:
+        with open(p, "rb") as f:
+            head = f.read(1024).decode("utf-8", "replace")
+    except OSError:
+        return None
+    m = _CACHE_HEAD_RE.match(head)
+    if m:
+        return {"source": json.loads(m.group(1)), "fetched": json.loads(m.group(2)),
+                "count": int(m.group(3))}
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or "tles" not in payload:
+        return None
+    return {"source": payload.get("source"), "fetched": payload.get("fetched"),
+            "count": payload.get("count")}
 
 
 def cache_read(key):
@@ -1167,18 +1196,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             files = []
         for p in files:
-            try:
-                payload = json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue  # skip corrupt entries
-            if not isinstance(payload, dict) or "tles" not in payload:
-                continue  # not a TLE set (e.g. satcat_map.json)
-            entries.append({
-                "key": p.stem,
-                "source": payload.get("source"),
-                "fetched": payload.get("fetched"),
-                "count": payload.get("count"),
-            })
+            meta = cache_meta(p)
+            if meta is None:
+                continue  # corrupt, or not a TLE set (e.g. satcat_map.json)
+            entries.append({"key": p.stem, **meta})
         self._respond(200, {"ok": True, "entries": entries})
 
     def _cache_get(self, key):
@@ -1243,7 +1264,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if ext in (".html", ".js", ".css"):
             self.send_header("Cache-Control", "no-cache")
-        elif ext == ".jpg":
+        elif ext in (".jpg", ".webp"):
+            # map tiles are re-requested after the frontend evicts them
             self.send_header("Cache-Control", "max-age=86400")
         self.send_header("Last-Modified", formatdate(mtime, usegmt=True))
         self.end_headers()

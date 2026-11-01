@@ -91,23 +91,31 @@
 
   let ui = null; // {field, local, playBtn, rateBtns, editing}
 
+  // Runs every animation frame while the clock runs, but the text changes at
+  // most once per displayed second: write the DOM only when a value changed
+  // (every write invalidates layout).
+  const shown = new Map();   // element -> last written text
+  function setText(el, text) {
+    if (el && shown.get(el) !== text) { el.textContent = text; shown.set(el, text); }
+  }
+  let lastUiState = '';
   function updateUI() {
+    const d = getDate();
+    const utc = SAT.util.fmtDate(d);
     // menu bar (always present)
-    const mbClock = document.getElementById('mb-clock');
+    setText(document.getElementById('mb-clock'), utc + ' UTC');
     const mbRate = document.getElementById('mb-rate');
-    if (mbClock) mbClock.textContent = SAT.util.fmtDate(getDate()) + ' UTC';
-    if (mbRate) {
-      mbRate.textContent = running ? rate + '×' : '❚❚ paused';
-      mbRate.classList.toggle('rt', running && rate === 1);
-    }
+    setText(mbRate, running ? rate + '×' : '❚❚ paused');
+    const st = running + '|' + rate + '|' + (ui ? ui.editing : '-');
+    const stChanged = st !== lastUiState;
+    lastUiState = st;
+    if (stChanged && mbRate) mbRate.classList.toggle('rt', running && rate === 1);
     if (!ui) return;
-    if (!ui.editing) {
-      ui.field.value = SAT.util.fmtDate(getDate());
-      ui.field.style.color = running ? '' : 'var(--warn)'; // amber while paused
-    }
-    ui.local.textContent = 'local ' + SAT.util.fmtDateLocal(getDate()) +
-      (running ? '' : '  ·  PAUSED');
-    ui.playBtn.textContent = running ? '❚❚ Pause' : '▶ Run';
+    if (!ui.editing && ui.field.value !== utc) ui.field.value = utc;
+    setText(ui.local, 'local ' + SAT.util.fmtDateLocal(d) + (running ? '' : '  ·  PAUSED'));
+    if (!stChanged) return;
+    if (!ui.editing) ui.field.style.color = running ? '' : 'var(--warn)'; // amber while paused
+    setText(ui.playBtn, running ? '❚❚ Pause' : '▶ Run');
     ui.rateBtns.forEach(b => b.classList.toggle('on', +b.dataset.rate === rate));
   }
 

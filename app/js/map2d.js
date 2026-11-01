@@ -3,27 +3,44 @@
  *
  * Plain classic script; attaches SAT.map2d = { init, requestRender }.
  * Projection: plate carrée. View state {scale, cx, cy} where cx/cy are the
- * map-fraction coordinates of the viewport center; scale 1 = fit-to-window
- * (whole world visible, letterboxed) up to 40x.
+ * map-fraction coordinates of the viewport center (0..1 = lon -180..180);
+ * scale 1 = fit-to-window (one world width) up to 40x. The drawable domain
+ * spans lon -360..+360 (cx -0.5..1.5): the world repeats half a turn on each
+ * side, so a view centred on the antimeridian never runs off the map.
+ *
+ * Base imagery: NASA Blue Marble NG (Sept 2004, topo + bathy) as a tile
+ * pyramid assets/bm/<z>/<x>_<y>.webp — 1350-px tiles, level z is
+ * (2700 << z) px wide, z = 3 is the full 21600x10800 mosaic. The visible
+ * tiles are composited into an offscreen canvas that is rebuilt only when
+ * the view or the set of loaded tiles changes.
  * ==========================================================================*/
 (function () {
   'use strict';
 
   var MAX_ZOOM = 40;
-  var IMG_SRC = 'assets/earth_day.jpg';
   var MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+  var TILE_DIR = 'assets/bm/', TILE_PX = 1350, MAX_LEVEL = 3;
+  var TILE_CAP = 32;   // decoded tiles kept above level 0 (~7 MB each)
+  var TILE_CONC = 4;   // parallel fetch + decode
 
   // ---- module state --------------------------------------------------------
   var body = null, winRef = null;
   var canvas = null, ctx = null;
   var cssW = 0, cssH = 0, dpr = 1;
   var view = { scale: 1, cx: 0.5, cy: 0.5 };
-  var baseImg = null, baseReady = false;
   var dirty = false, rafQueued = false;
   var markerHits = [];                 // [{id,x,y}] sat marker px positions from last render
   var nightCache = { key: NaN, poly: null, sun: null, poleLat: -90 };
   var drag = null;
   var renderErrWarned = false;
+  var lastSimMs = NaN, lastWallMs = 0; // clock-driven redraw throttle
+
+  // tile pyramid
+  var tiles = new Map();   // 'z/x/y' -> {z,x,y,state 0 queued|1 loading|2 ready|3 failed,img,used}
+  var tileQueue = [];      // queued tiles, newest request last
+  var tileLoading = 0, tileGen = 0, useTick = 0;
+  var baseCv = null, baseCtx = null, baseKey = '';
 
   // HUD elements
   var elCursor = null, elSel = null, elEpoch = null, elToolbar = null;
@@ -63,7 +80,8 @@
     return { w: w, h: h, left: cssW / 2 - view.cx * w, top: cssH / 2 - view.cy * h };
   }
 
-  // lon may be exactly +180 (right map edge) — deliberately NOT wrapped here.
+  // Unwrapped longitude in -> px out: lon +200 lands half a world right of
+  // +20, i.e. in the eastern copy. Callers pick the copy (see shifts()).
   function lonLatToPx(lonDeg, latDeg, m) {
     return { x: m.left + (lonDeg + 180) / 360 * m.w,
              y: m.top + (90 - latDeg) / 180 * m.h };
@@ -71,21 +89,43 @@
 
   function pxToLonLat(x, y, m) {
     var fx = (x - m.left) / m.w, fy = (y - m.top) / m.h;
-    if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
+    if (fx < -0.5 || fx > 1.5 || fy < 0 || fy > 1) return null;
     return { lonDeg: SAT.util.wrapLon(fx * 360 - 180), latDeg: 90 - fy * 180 };
   }
 
+  // Drawable domain (lon -360..+360) in CSS px.
+  function domain(m) {
+    return { x0: m.left - m.w / 2, x1: m.left + 1.5 * m.w, y0: m.top, y1: m.top + m.h };
+  }
+
+  // Visible longitude window (unwrapped, clipped to the domain).
+  function visLon(m) {
+    return { lo: Math.max(-360, -m.left / m.w * 360 - 180),
+             hi: Math.min(360, (cssW - m.left) / m.w * 360 - 180) };
+  }
+
+  // World-copy indices k (shift = k*360°) that put an unwrapped longitude
+  // span [lo, hi] (+pad degrees, e.g. for labels) inside the visible window.
+  function shifts(lo, hi, vl, pad) {
+    var out = [];
+    for (var k = -2; k <= 2; k++) {
+      if (hi + 360 * k >= vl.lo - pad && lo + 360 * k <= vl.hi + pad) out.push(k);
+    }
+    return out;
+  }
+
   // Empty margin on any side must never exceed 20% of the viewport dimension.
-  function clampAxis(c, mapDim, viewDim) {
-    var lo = 0.3 * viewDim / mapDim, hi = 1 - lo;
-    return lo > hi ? 0.5 : Math.min(hi, Math.max(lo, c));
+  // [a, b] is the axis extent in map fractions.
+  function clampAxis(c, a, b, mapDim, viewDim) {
+    var lo = a + 0.3 * viewDim / mapDim, hi = b - 0.3 * viewDim / mapDim;
+    return lo > hi ? (a + b) / 2 : Math.min(hi, Math.max(lo, c));
   }
 
   function clampView() {
     view.scale = Math.min(MAX_ZOOM, Math.max(1, view.scale));
     var m = metrics();
-    view.cx = clampAxis(view.cx, m.w, cssW);
-    view.cy = clampAxis(view.cy, m.h, cssH);
+    view.cx = clampAxis(view.cx, -0.5, 1.5, m.w, cssW);
+    view.cy = clampAxis(view.cy, 0, 1, m.h, cssH);
   }
 
   // Zoom keeping the map point under (mx,my) fixed on screen.
@@ -127,6 +167,164 @@
     });
   }
 
+  // Clock ticks arrive every frame, but at 1x a LEO sat crosses a pixel of
+  // the world view only every few seconds. Redraw once the fastest LEO motion
+  // (~7.8 km/s) would shift something ~0.3 px at the current zoom, and at
+  // least 4x per second so the HUD readouts stay live.
+  function onTime(p) {
+    if (p && p.jumped) { requestRender(); return; }
+    var sim = p && p.date ? p.date.getTime() : SAT.clock.getDate().getTime();
+    var kmPerPx = 40075 / Math.max(1, metrics().w);
+    var simStep = 0.3 * kmPerPx / 7.8 * 1000;
+    if (!(Math.abs(sim - lastSimMs) < simStep) || performance.now() - lastWallMs >= 250) {
+      requestRender();
+    }
+  }
+
+  // ---- Blue Marble tile pyramid --------------------------------------------
+
+  function tileEntry(z, x, y) { return tiles.get(z + '/' + x + '/' + y); }
+
+  // Mark a tile as needed by the current composite; returns it when decoded.
+  function wantTile(z, x, y) {
+    var k = z + '/' + x + '/' + y, t = tiles.get(k);
+    if (!t) {
+      t = { z: z, x: x, y: y, state: 0, img: null, used: useTick };
+      tiles.set(k, t);
+      tileQueue.push(t);
+    }
+    t.used = useTick;
+    return t.state === 2 ? t.img : null;
+  }
+
+  // fetch + createImageBitmap decodes off the main thread (no pan jank)
+  function decodeTile(url) {
+    if (typeof createImageBitmap === 'function' && typeof fetch === 'function') {
+      return fetch(url).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      }).then(function (b) { return createImageBitmap(b); });
+    }
+    return new Promise(function (res, rej) {
+      var im = new Image();
+      im.onload = function () { res(im); };
+      im.onerror = function () { rej(new Error('tile load failed')); };
+      im.src = url;
+    });
+  }
+
+  function pumpTiles() {
+    while (tileLoading < TILE_CONC && tileQueue.length) {
+      var t = tileQueue.pop();                 // newest request first
+      if (t.z > 0 && t.used !== useTick) {     // scrolled out of view meanwhile
+        tiles.delete(t.z + '/' + t.x + '/' + t.y);
+        continue;
+      }
+      t.state = 1;
+      tileLoading++;
+      loadTile(t);
+    }
+  }
+
+  function loadTile(t) {
+    decodeTile(TILE_DIR + t.z + '/' + t.x + '_' + t.y + '.webp').then(function (img) {
+      t.img = img;
+      t.state = 2;
+    }, function () {
+      t.state = 3;                             // missing tile: never retried
+    }).then(function () {
+      tileLoading--;
+      tileGen++;                               // invalidates the base composite
+      evictTiles();
+      requestRender();
+      pumpTiles();
+    });
+  }
+
+  // LRU over decoded tiles; level 0 (the always-available backdrop) is pinned.
+  function evictTiles() {
+    var loaded = [];
+    tiles.forEach(function (t) { if (t.state === 2 && t.z > 0) loaded.push(t); });
+    if (loaded.length <= TILE_CAP) return;
+    loaded.sort(function (a, b) { return a.used - b.used; });
+    for (var i = 0; i < loaded.length - TILE_CAP; i++) {
+      var t = loaded[i];
+      if (t.used === useTick) break;           // the current view needs it
+      if (t.img && t.img.close) t.img.close();
+      tiles.delete(t.z + '/' + t.x + '/' + t.y);
+    }
+  }
+
+  // smallest level whose resolution covers the on-screen world width
+  function pickLevel(m) {
+    var need = m.w * dpr * 0.85;
+    for (var z = 0; z < MAX_LEVEL; z++) if ((2 * TILE_PX << z) >= need) return z;
+    return MAX_LEVEL;
+  }
+
+  function drawLevel(b, m, z, vx0, vx1, vy0, vy1, target) {
+    var nx = 2 << z, ny = 1 << z;
+    var tw = m.w * dpr / nx, th = m.h * dpr / ny, top = m.top * dpr;
+    var ty0 = Math.max(0, Math.floor((vy0 - top) / th));
+    var ty1 = Math.min(ny - 1, Math.floor((vy1 - top - 1e-6) / th));
+    for (var k = -1; k <= 1; k++) {            // world copies
+      var ox = (m.left + k * m.w) * dpr;
+      var tx0 = Math.max(0, Math.floor((vx0 - ox) / tw));
+      var tx1 = Math.min(nx - 1, Math.floor((vx1 - ox - 1e-6) / tw));
+      for (var ty = ty0; ty <= ty1; ty++) {
+        // tile edges snapped to device pixels: neighbours share an edge, no seams
+        var y0 = Math.round(top + ty * th), y1 = Math.round(top + (ty + 1) * th);
+        for (var tx = tx0; tx <= tx1; tx++) {
+          var x0 = Math.round(ox + tx * tw), x1 = Math.round(ox + (tx + 1) * tw);
+          var img = wantTile(z, tx, ty);
+          if (img) { b.drawImage(img, x0, y0, x1 - x0, y1 - y0); continue; }
+          if (!target || z < 2) continue;
+          // parent quadrant stands in while the tile loads
+          var p = tileEntry(z - 1, tx >> 1, ty >> 1);
+          if (p && p.state === 2) {
+            p.used = useTick;
+            var h = TILE_PX / 2;
+            b.drawImage(p.img, (tx & 1) * h, (ty & 1) * h, h, h, x0, y0, x1 - x0, y1 - y0);
+          }
+        }
+      }
+    }
+  }
+
+  // Composite the visible tiles (device px) into baseCv; no-op if unchanged.
+  function composeBase(m) {
+    var W = canvas.width, H = canvas.height;
+    if (baseCv.width !== W || baseCv.height !== H) {
+      baseCv.width = W; baseCv.height = H; baseKey = '';
+    }
+    var z = pickLevel(m);
+    var key = W + 'x' + H + '|' + m.w + '|' + m.left + '|' + m.top + '|' + z + '|' + tileGen;
+    if (key === baseKey) return;
+    baseKey = key;
+    useTick++;
+    var b = baseCtx;
+    b.setTransform(1, 0, 0, 1, 0, 0);
+    b.fillStyle = '#05070a';
+    b.fillRect(0, 0, W, H);
+    var d = domain(m);
+    var vx0 = Math.max(0, Math.round(d.x0 * dpr)), vx1 = Math.min(W, Math.round(d.x1 * dpr));
+    var vy0 = Math.max(0, Math.round(d.y0 * dpr)), vy1 = Math.min(H, Math.round(d.y1 * dpr));
+    if (vx1 > vx0 && vy1 > vy0) {
+      b.fillStyle = '#0a1c2e';                 // ocean tone until tiles decode
+      b.fillRect(vx0, vy0, vx1 - vx0, vy1 - vy0);
+      b.save();
+      b.beginPath();
+      b.rect(vx0, vy0, vx1 - vx0, vy1 - vy0);
+      b.clip();
+      b.imageSmoothingEnabled = true;
+      b.imageSmoothingQuality = 'high';
+      if (z > 0) drawLevel(b, m, 0, vx0, vx1, vy0, vy1, false);   // backdrop
+      drawLevel(b, m, z, vx0, vx1, vy0, vy1, true);
+      b.restore();
+    }
+    pumpTiles();
+  }
+
   // ---- night shading (cached per 30 simulated seconds) ---------------------
 
   function getNight(date) {
@@ -144,36 +342,32 @@
     return nightCache;
   }
 
+  // The terminator (lon -180..180) is chained through the three world copies
+  // into one curve spanning -540..540, so shade and line cross the
+  // antimeridian without a seam; the shade closes along the dark pole's edge.
   function drawNight(m, date, st) {
     var nc = getNight(date);
     if (!nc.poly || nc.poly.length < 2) return;
-    var P = nc.poly, i, p;
-    var first = P[0], last = P[P.length - 1];
-
-    if (st.showNightShade) {
-      ctx.beginPath();
-      p = lonLatToPx(-180, first.latDeg, m); ctx.moveTo(p.x, p.y);
-      for (i = 0; i < P.length; i++) {
-        p = lonLatToPx(P[i].lonDeg, P[i].latDeg, m); ctx.lineTo(p.x, p.y);
+    var P = nc.poly, n = P.length, k, i, p;
+    var shade = new Path2D(), line = new Path2D(), started = false;
+    for (k = -1; k <= 1; k++) {
+      for (i = 0; i < n; i++) {
+        p = lonLatToPx(P[i].lonDeg + 360 * k, P[i].latDeg, m);
+        if (started) { shade.lineTo(p.x, p.y); line.lineTo(p.x, p.y); }
+        else { shade.moveTo(p.x, p.y); line.moveTo(p.x, p.y); started = true; }
       }
-      p = lonLatToPx(180, last.latDeg, m); ctx.lineTo(p.x, p.y);
-      p = lonLatToPx(180, nc.poleLat, m); ctx.lineTo(p.x, p.y);
-      p = lonLatToPx(-180, nc.poleLat, m); ctx.lineTo(p.x, p.y);
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(0,0,10,0.35)';
-      ctx.fill();
     }
-
+    if (st.showNightShade) {
+      p = lonLatToPx(540, nc.poleLat, m); shade.lineTo(p.x, p.y);
+      p = lonLatToPx(-540, nc.poleLat, m); shade.lineTo(p.x, p.y);
+      shade.closePath();
+      ctx.fillStyle = 'rgba(0,0,10,0.35)';
+      ctx.fill(shade);
+    }
     if (st.showTerminator) {
-      ctx.beginPath();
-      p = lonLatToPx(-180, first.latDeg, m); ctx.moveTo(p.x, p.y);
-      for (i = 0; i < P.length; i++) {
-        p = lonLatToPx(P[i].lonDeg, P[i].latDeg, m); ctx.lineTo(p.x, p.y);
-      }
-      p = lonLatToPx(180, last.latDeg, m); ctx.lineTo(p.x, p.y);
       ctx.strokeStyle = 'rgba(255,205,110,0.35)';
       ctx.lineWidth = 1;
-      ctx.stroke();
+      ctx.stroke(line);
     }
   }
 
@@ -199,17 +393,18 @@
   }
 
   function drawGraticule(m) {
-    // Visible portion of the map, in CSS px
-    var vx0 = Math.max(m.left, 0), vx1 = Math.min(m.left + m.w, cssW);
-    var vy0 = Math.max(m.top, 0), vy1 = Math.min(m.top + m.h, cssH);
+    // Visible portion of the drawable domain, in CSS px
+    var d = domain(m);
+    var vx0 = Math.max(d.x0, 0), vx1 = Math.min(d.x1, cssW);
+    var vy0 = Math.max(d.y0, 0), vy1 = Math.min(d.y1, cssH);
     if (vx1 <= vx0 || vy1 <= vy0) return;
     var lon, lat, p;
 
     ctx.lineWidth = 1;
-    for (lon = -180; lon <= 180; lon += 30) {
+    for (lon = -360; lon <= 360; lon += 30) {
       p = lonLatToPx(lon, 0, m);
       if (p.x < vx0 - 1 || p.x > vx1 + 1) continue;
-      ctx.strokeStyle = lon === 0 ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.10)';
+      ctx.strokeStyle = lon % 360 === 0 ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.10)';
       ctx.beginPath();
       ctx.moveTo(p.x, m.top);
       ctx.lineTo(p.x, m.top + m.h);
@@ -220,19 +415,19 @@
       if (p.y < vy0 - 1 || p.y > vy1 + 1) continue;
       ctx.strokeStyle = lat === 0 ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.10)';
       ctx.beginPath();
-      ctx.moveTo(m.left, p.y);
-      ctx.lineTo(m.left + m.w, p.y);
+      ctx.moveTo(vx0, p.y);
+      ctx.lineTo(vx1, p.y);
       ctx.stroke();
     }
 
-    // Labels along the visible map edges
+    // Labels along the visible map edges (geographic, i.e. wrapped, values)
     ctx.font = '10px ' + MONO;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
-    for (lon = -180; lon <= 150; lon += 30) {
+    for (lon = -360; lon < 360; lon += 30) {
       p = lonLatToPx(lon, 0, m);
       if (p.x < vx0 + 2 || p.x > vx1 - 28) continue;
-      haloText(lonLabel(lon), p.x + 3, vy1 - 4, 'rgba(255,255,255,0.55)');
+      haloText(lonLabel(SAT.util.wrapLon(lon)), p.x + 3, vy1 - 4, 'rgba(255,255,255,0.55)');
     }
     for (lat = -60; lat <= 60; lat += 30) {
       p = lonLatToPx(0, lat, m);
@@ -244,7 +439,7 @@
   // ---- satellite layers ----------------------------------------------------
 
   // Footprint circle. Points from SAT.prop.footprint are NOT antimeridian-split.
-  function drawFootprint(m, geo, color, selected) {
+  function drawFootprint(m, geo, color, selected, vl) {
     var pts;
     try { pts = SAT.prop.footprint(geo.latDeg, geo.lonDeg, geo.heightKm, 90); }
     catch (e) { return; }
@@ -260,36 +455,29 @@
     ctx.lineWidth = selected ? 1.6 : 1;
     ctx.lineJoin = 'round';
 
-    var i, p;
+    var i, p, k;
     if (encN || encS) {
-      // Circle encloses a pole: every meridian crosses the boundary exactly once,
-      // so sort by longitude and close the fill along the polar map edge.
+      // Circle encloses a pole: every meridian crosses the boundary exactly
+      // once, so sort by longitude, chain the boundary through the three
+      // world copies, and close the fill along the polar map edge.
       var poleLat = encN ? 90 : -90;
       var sorted = pts.slice().sort(function (a, b) { return a.lonDeg - b.lonDeg; });
-      var first = sorted[0], last = sorted[sorted.length - 1];
-
-      ctx.beginPath();
-      p = lonLatToPx(-180, first.latDeg, m); ctx.moveTo(p.x, p.y);
-      for (i = 0; i < sorted.length; i++) {
-        p = lonLatToPx(sorted[i].lonDeg, sorted[i].latDeg, m); ctx.lineTo(p.x, p.y);
+      var fill = new Path2D(), edge = new Path2D(), started = false;
+      for (k = -1; k <= 1; k++) {
+        for (i = 0; i < sorted.length; i++) {
+          p = lonLatToPx(sorted[i].lonDeg + 360 * k, sorted[i].latDeg, m);
+          if (started) { fill.lineTo(p.x, p.y); edge.lineTo(p.x, p.y); }
+          else { fill.moveTo(p.x, p.y); edge.moveTo(p.x, p.y); started = true; }
+        }
       }
-      p = lonLatToPx(180, last.latDeg, m); ctx.lineTo(p.x, p.y);
-      p = lonLatToPx(180, poleLat, m); ctx.lineTo(p.x, p.y);
-      p = lonLatToPx(-180, poleLat, m); ctx.lineTo(p.x, p.y);
-      ctx.closePath();
-      ctx.fill();
-
-      // Outline: boundary only (no line along the map edge)
-      ctx.beginPath();
-      p = lonLatToPx(-180, first.latDeg, m); ctx.moveTo(p.x, p.y);
-      for (i = 0; i < sorted.length; i++) {
-        p = lonLatToPx(sorted[i].lonDeg, sorted[i].latDeg, m); ctx.lineTo(p.x, p.y);
-      }
-      p = lonLatToPx(180, last.latDeg, m); ctx.lineTo(p.x, p.y);
-      ctx.stroke();
+      p = lonLatToPx(sorted[sorted.length - 1].lonDeg + 360, poleLat, m); fill.lineTo(p.x, p.y);
+      p = lonLatToPx(sorted[0].lonDeg - 360, poleLat, m); fill.lineTo(p.x, p.y);
+      fill.closePath();
+      ctx.fill(fill);
+      ctx.stroke(edge);   // boundary only, no line along the map edge
     } else {
-      // Unwrap longitudes into a continuous closed path; draw shifted copies
-      // (±360°) so parts crossing the antimeridian appear on the other edge.
+      // Unwrap longitudes into a continuous closed path, then draw it in
+      // every world copy where it is visible.
       var path = new Path2D();
       var lonPrev = pts[0].lonDeg, minL = lonPrev, maxL = lonPrev;
       p = lonLatToPx(lonPrev, pts[0].latDeg, m);
@@ -306,12 +494,10 @@
       }
       path.closePath();
 
-      var offsets = [0];
-      if (maxL > 180) offsets.push(-m.w);
-      if (minL < -180) offsets.push(m.w);
-      for (i = 0; i < offsets.length; i++) {
+      var ks = shifts(minL, maxL, vl, 0);
+      for (i = 0; i < ks.length; i++) {
         ctx.save();
-        ctx.translate(offsets[i], 0);
+        ctx.translate(ks[i] * m.w, 0);
         ctx.fill(path);
         ctx.stroke(path);
         ctx.restore();
@@ -319,9 +505,11 @@
     }
   }
 
-  // Ground track: null entries mark antimeridian splits (start new segment).
-  // Past half dim/thin, future half brighter/thicker, split at current time.
-  function drawTrack(m, sat, date, nowMs, st) {
+  // Ground track: wrapped longitudes are unwrapped into continuous runs (a
+  // null entry is a propagation gap and starts a new run), then the runs are
+  // drawn in every world copy they reach. Past half dim/thin, future half
+  // brighter/thicker, split at the current time.
+  function drawTrack(m, sat, date, nowMs, st, vl) {
     var gt;
     try {
       gt = SAT.prop.groundTrack(sat, date, st.trackMinutesBack || 0, st.trackMinutesFwd || 0);
@@ -337,37 +525,50 @@
       path.lineTo(pb.x, pb.y);
     }
 
-    var prev = null, i, p;
+    var prev = null, prevLon = 0, minL = Infinity, maxL = -Infinity, i, p;
     for (i = 0; i < gt.points.length; i++) {
       p = gt.points[i];
       if (!p) { prev = null; continue; }
+      var lon = p.lonDeg;
       if (prev) {
+        while (lon - prevLon > 180) lon -= 360;
+        while (lon - prevLon < -180) lon += 360;
         var ecl = p.sunlit === false;   // shadow state of this sample
         if (p.t <= nowMs) {
-          seg(ecl ? pastEcl : past, prev.lonDeg, prev.latDeg, p.lonDeg, p.latDeg);
+          seg(ecl ? pastEcl : past, prevLon, prev.latDeg, lon, p.latDeg);
         } else if (prev.t >= nowMs) {
-          seg(ecl ? futEcl : fut, prev.lonDeg, prev.latDeg, p.lonDeg, p.latDeg);
+          seg(ecl ? futEcl : fut, prevLon, prev.latDeg, lon, p.latDeg);
         } else {
           // Segment spans "now": split at the interpolated current position.
           var f = (nowMs - prev.t) / (p.t - prev.t);
-          var mLon = prev.lonDeg + (p.lonDeg - prev.lonDeg) * f;
+          var mLon = prevLon + (lon - prevLon) * f;
           var mLat = prev.latDeg + (p.latDeg - prev.latDeg) * f;
-          seg(ecl ? pastEcl : past, prev.lonDeg, prev.latDeg, mLon, mLat);
-          seg(ecl ? futEcl : fut, mLon, mLat, p.lonDeg, p.latDeg);
+          seg(ecl ? pastEcl : past, prevLon, prev.latDeg, mLon, mLat);
+          seg(ecl ? futEcl : fut, mLon, mLat, lon, p.latDeg);
         }
       }
+      if (lon < minL) minL = lon;
+      if (lon > maxL) maxL = lon;
       prev = p;
+      prevLon = lon;
     }
+    if (!(maxL >= minL)) return;
 
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.strokeStyle = sat.color || '#4fc3f7';
-    ctx.globalAlpha = 0.45; ctx.lineWidth = 1; ctx.stroke(past);
-    ctx.globalAlpha = 0.9; ctx.lineWidth = 1.6; ctx.stroke(fut);
-    ctx.setLineDash([3, 4]);
-    ctx.globalAlpha = 0.22; ctx.lineWidth = 1; ctx.stroke(pastEcl);
-    ctx.globalAlpha = 0.45; ctx.lineWidth = 1.4; ctx.stroke(futEcl);
-    ctx.setLineDash([]);
+    var ks = shifts(minL, maxL, vl, 0);
+    for (i = 0; i < ks.length; i++) {
+      ctx.save();
+      ctx.translate(ks[i] * m.w, 0);
+      ctx.globalAlpha = 0.45; ctx.lineWidth = 1; ctx.stroke(past);
+      ctx.globalAlpha = 0.9; ctx.lineWidth = 1.6; ctx.stroke(fut);
+      ctx.setLineDash([3, 4]);
+      ctx.globalAlpha = 0.22; ctx.lineWidth = 1; ctx.stroke(pastEcl);
+      ctx.globalAlpha = 0.45; ctx.lineWidth = 1.4; ctx.stroke(futEcl);
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
     ctx.globalAlpha = 1;
   }
 
@@ -383,105 +584,133 @@
     ctx.fillText(text, x, y);
   }
 
-  function drawSatMarker(m, sat, geo, selected, st) {
-    var p = lonLatToPx(SAT.util.wrapLon(geo.lonDeg), geo.latDeg, m);
-    // 7px filled square, 1px dark outline
-    ctx.fillStyle = sat.color || '#4fc3f7';
-    ctx.strokeStyle = 'rgba(8,10,14,0.9)';
-    ctx.lineWidth = 1;
-    ctx.fillRect(p.x - 3.5, p.y - 3.5, 7, 7);
-    ctx.strokeRect(p.x - 3.5, p.y - 3.5, 7, 7);
+  // Screen positions of a point object in every world copy where it (plus a
+  // label-sized margin to its right) is visible.
+  function copiesOf(lonDeg, latDeg, m, vl) {
+    var lon = SAT.util.wrapLon(lonDeg);
+    var pad = 220 / m.w * 360;                 // ~220 px of label, in degrees
+    var ks = shifts(lon, lon, vl, pad), out = [];
+    for (var i = 0; i < ks.length; i++) out.push(lonLatToPx(lon + 360 * ks[i], latDeg, m));
+    return out;
+  }
 
-    if (selected) {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
+  function drawSatMarker(m, sat, geo, selected, st, vl) {
+    var ps = copiesOf(geo.lonDeg, geo.latDeg, m, vl);
+    for (var i = 0; i < ps.length; i++) {
+      var p = ps[i];
+      // 7px filled square, 1px dark outline
+      ctx.fillStyle = sat.color || '#4fc3f7';
+      ctx.strokeStyle = 'rgba(8,10,14,0.9)';
+      ctx.lineWidth = 1;
+      ctx.fillRect(p.x - 3.5, p.y - 3.5, 7, 7);
+      ctx.strokeRect(p.x - 3.5, p.y - 3.5, 7, 7);
+
+      if (selected) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+      if (!sat.show || sat.show.label) {
+        drawSatLabel(sat.name || '', p.x + 8, p.y, st.labelSize || 11);
+      }
+      markerHits.push({ id: sat.id, x: p.x, y: p.y });
     }
-    if (!sat.show || sat.show.label) {
-      drawSatLabel(sat.name || '', p.x + 8, p.y, st.labelSize || 11);
-    }
-    markerHits.push({ id: sat.id, x: p.x, y: p.y });
   }
 
   // ---- stations / sun / moon -----------------------------------------------
 
-  function drawStations(m, st) {
+  function drawStations(m, st, vl) {
     var locs = (SAT.state && SAT.state.locations) || [];
     for (var i = 0; i < locs.length; i++) {
       var loc = locs[i];
       if (!loc || !loc.show) continue;
-      var p = lonLatToPx(SAT.util.wrapLon(loc.lonDeg), loc.latDeg, m);
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y - 5.5);
-      ctx.lineTo(p.x - 5, p.y + 4);
-      ctx.lineTo(p.x + 5, p.y + 4);
-      ctx.closePath();
-      ctx.fillStyle = loc.color || '#ff5252';
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(8,10,14,0.9)';
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      if (loc.active) {
+      var ps = copiesOf(loc.lonDeg, loc.latDeg, m, vl);
+      for (var j = 0; j < ps.length; j++) {
+        var p = ps[j];
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 8.5, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-        ctx.lineWidth = 1.2;
+        ctx.moveTo(p.x, p.y - 5.5);
+        ctx.lineTo(p.x - 5, p.y + 4);
+        ctx.lineTo(p.x + 5, p.y + 4);
+        ctx.closePath();
+        ctx.fillStyle = loc.color || '#ff5252';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(8,10,14,0.9)';
+        ctx.lineWidth = 1;
         ctx.stroke();
+        if (loc.active) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 8.5, 0, Math.PI * 2);
+          ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+        }
+        drawSatLabel(loc.name || '', p.x + 9, p.y, st.labelSize || 11);
       }
-      drawSatLabel(loc.name || '', p.x + 9, p.y, st.labelSize || 11);
     }
   }
 
-  function drawSun(m, date) {
+  function drawSun(m, date, vl) {
     var s;
     try { s = SAT.util.sunSubpoint(date); } catch (e) { return; }
-    var p = lonLatToPx(SAT.util.wrapLon(s.lonDeg), s.latDeg, m);
-    ctx.strokeStyle = '#ffd54f';
-    ctx.lineWidth = 1.5;
-    for (var k = 0; k < 8; k++) {
-      var a = k * Math.PI / 4;
+    copiesOf(s.lonDeg, s.latDeg, m, vl).forEach(function (p) {
+      ctx.strokeStyle = '#ffd54f';
+      ctx.lineWidth = 1.5;
+      for (var k = 0; k < 8; k++) {
+        var a = k * Math.PI / 4;
+        ctx.beginPath();
+        ctx.moveTo(p.x + Math.cos(a) * 7, p.y + Math.sin(a) * 7);
+        ctx.lineTo(p.x + Math.cos(a) * 11, p.y + Math.sin(a) * 11);
+        ctx.stroke();
+      }
       ctx.beginPath();
-      ctx.moveTo(p.x + Math.cos(a) * 7, p.y + Math.sin(a) * 7);
-      ctx.lineTo(p.x + Math.cos(a) * 11, p.y + Math.sin(a) * 11);
+      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffd54f';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(60,40,0,0.6)';
+      ctx.lineWidth = 1;
       ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-    ctx.fillStyle = '#ffd54f';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(60,40,0,0.6)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
+    });
   }
 
-  function drawMoon(m, date) {
+  function drawMoon(m, date, vl) {
     var s;
     try { s = SAT.util.moonSubpoint(date); } catch (e) { return; }
-    var p = lonLatToPx(SAT.util.wrapLon(s.lonDeg), s.latDeg, m);
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-    ctx.fillStyle = '#c9ccd1';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(8,10,14,0.6)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    // subtle crater dots
-    ctx.fillStyle = 'rgba(120,124,132,0.85)';
-    ctx.beginPath(); ctx.arc(p.x - 1.6, p.y - 1.2, 1.1, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(p.x + 1.7, p.y + 0.4, 0.8, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(p.x - 0.2, p.y + 2.0, 0.7, 0, Math.PI * 2); ctx.fill();
+    copiesOf(s.lonDeg, s.latDeg, m, vl).forEach(function (p) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#c9ccd1';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(8,10,14,0.6)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // subtle crater dots
+      ctx.fillStyle = 'rgba(120,124,132,0.85)';
+      ctx.beginPath(); ctx.arc(p.x - 1.6, p.y - 1.2, 1.1, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x + 1.7, p.y + 0.4, 0.8, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x - 0.2, p.y + 2.0, 0.7, 0, Math.PI * 2); ctx.fill();
+    });
   }
 
   // ---- HUD readouts --------------------------------------------------------
+
+  // HUD writes only when the text changes (each write forces a layout pass)
+  function setHud(el, text) {
+    if (text == null) {
+      if (el.style.display !== 'none') el.style.display = 'none';
+      return;
+    }
+    if (el.textContent !== text) el.textContent = text;
+    if (el.style.display !== 'block') el.style.display = 'block';
+  }
 
   function updateReadouts(date) {
     var selId = SAT.state && SAT.state.selection ? SAT.state.selection.satId : null;
     var sat = selId && SAT.state.getSat ? SAT.state.getSat(selId) : null;
     if (!sat) {
-      elSel.style.display = 'none';
-      elEpoch.style.display = 'none';
+      setHud(elSel, null);
+      setHud(elEpoch, null);
       return;
     }
 
@@ -500,17 +729,14 @@
                '°  RNG ' + la.rangeKm.toFixed(0) + ' km';
       }
     }
-    elSel.textContent = txt;
-    elSel.style.display = 'block';
+    setHud(elSel, txt);
 
     var sr = sat._satrec;
     if (sr && isFinite(sr.jdsatepoch)) {
       var jdNow = date.getTime() / 86400000 + 2440587.5;
-      var ageD = jdNow - sr.jdsatepoch;
-      elEpoch.textContent = 'epoch age ' + ageD.toFixed(1) + ' d';
-      elEpoch.style.display = 'block';
+      setHud(elEpoch, 'epoch age ' + (jdNow - sr.jdsatepoch).toFixed(1) + ' d');
     } else {
-      elEpoch.style.display = 'none';
+      setHud(elEpoch, null);
     }
   }
 
@@ -522,26 +748,22 @@
     var nowMs = date.getTime();
     var st = settings();
     var m = metrics();
+    var vl = visLon(m);
     markerHits = [];
+    lastSimMs = nowMs;
+    lastWallMs = performance.now();
 
+    // base imagery: one device-pixel blit of the cached tile composite
+    composeBase(m);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(baseCv, 0, 0);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#05070a';
-    ctx.fillRect(0, 0, cssW, cssH);
 
+    var d = domain(m);
     ctx.save();
     ctx.beginPath();
-    ctx.rect(m.left, m.top, m.w, m.h);
+    ctx.rect(d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0);
     ctx.clip();
-
-    // base image
-    if (baseReady) {
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = view.scale > 4 ? 'high' : 'medium';
-      ctx.drawImage(baseImg, m.left, m.top, m.w, m.h);
-    } else {
-      ctx.fillStyle = '#0a1c2e';
-      ctx.fillRect(m.left, m.top, m.w, m.h);
-    }
 
     if (st.showNightShade || st.showTerminator) drawNight(m, date, st);
     if (st.showGraticule) drawGraticule(m);
@@ -560,23 +782,23 @@
     for (i = 0; i < entries.length; i++) {
       e = entries[i];
       if (!e.sat.show || e.sat.show.footprint) {
-        try { drawFootprint(m, e.geo, e.sat.color, e.sat.id === selId); } catch (err) {}
+        try { drawFootprint(m, e.geo, e.sat.color, e.sat.id === selId, vl); } catch (err) {}
       }
     }
     for (i = 0; i < entries.length; i++) {
       e = entries[i];
       if (!e.sat.show || e.sat.show.groundTrack) {
-        try { drawTrack(m, e.sat, date, nowMs, st); } catch (err) {}
+        try { drawTrack(m, e.sat, date, nowMs, st, vl); } catch (err) {}
       }
     }
     for (i = 0; i < entries.length; i++) {
       e = entries[i];
-      try { drawSatMarker(m, e.sat, e.geo, e.sat.id === selId, st); } catch (err) {}
+      try { drawSatMarker(m, e.sat, e.geo, e.sat.id === selId, st, vl); } catch (err) {}
     }
 
-    drawStations(m, st);
-    if (st.showSun) drawSun(m, date);
-    if (st.showMoon) drawMoon(m, date);
+    drawStations(m, st, vl);
+    if (st.showSun) drawSun(m, date, vl);
+    if (st.showMoon) drawMoon(m, date, vl);
 
     ctx.restore();
     updateReadouts(date);
@@ -789,17 +1011,18 @@
     canvas = document.createElement('canvas');
     canvas.className = 'm2d-canvas';
     body.appendChild(canvas);
-    ctx = canvas.getContext('2d');
+    ctx = canvas.getContext('2d', { alpha: false });
+    baseCv = document.createElement('canvas');
+    baseCtx = baseCv.getContext('2d', { alpha: false });
 
     buildHud();
     buildToolbar();
     wireInput();
 
-    // base earth texture (loaded once)
-    baseImg = new Image();
-    baseImg.onload = function () { baseReady = true; requestRender(); };
-    baseImg.onerror = function () { baseReady = false; requestRender(); };
-    baseImg.src = IMG_SRC;
+    // level 0 (2700x1350) is the always-present backdrop: fetch it up front
+    wantTile(0, 0, 0);
+    wantTile(0, 1, 0);
+    pumpTiles();
 
     // resize plumbing: win-resize event + ResizeObserver safety net
     body.addEventListener('win-resize', resize);
@@ -809,7 +1032,7 @@
     resize();
 
     // bus wiring — re-render on all relevant events
-    SAT.bus.on('time', function () { requestRender(); });
+    SAT.bus.on('time', onTime);
     SAT.bus.on('sats-changed', requestRender);
     SAT.bus.on('selection-changed', requestRender);
     SAT.bus.on('locations-changed', requestRender);

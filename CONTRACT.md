@@ -16,9 +16,17 @@ namespace. No external network access from the frontend except the local backend
   app/
     index.html               # loads CSS + scripts in fixed order (see below)
     css/app.css
-    assets/earth_day.jpg     # 5400x2700 equirectangular NASA Blue Marble (topo+bathy, no borders)
-    assets/earth_night.jpg   # 4800x2400 equirectangular night lights
-    js/vendor/satellite.min.js   # satellite.js 5.0 UMD -> global `satellite`
+    assets/bm/<z>/<x>_<y>.webp   # 2D-map tile pyramid, NASA Blue Marble NG Sept 2004
+                                 #   (topo+bathy, no borders): 1350-px tiles, level z is
+                                 #   (2700<<z) x (1350<<z), z=0..3 (z=3 = full 21600x10800)
+    assets/earth_day_8k.webp # 8192x4096 globe texture, same imagery (tools/make_basemap.py)
+    assets/earth_day.jpg     # 5400x2700 Blue Marble (Dec) — globe fallback, icon source;
+                             #   also referenced by other local projects: keep in place
+    assets/earth_night_8k.webp   # 8192x4096 NASA Black Marble 2016 night lights (VIIRS)
+    assets/earth_night.jpg   # 2400x1200 older night lights — globe fallback
+    js/vendor/satellite.min.js   # satellite.js 5.0 UMD -> global `satellite` (patched:
+                                 #   keeps the deep-space integrator state, see header)
+    js/vendor/bsc5.js            # SAT.bsc5: Yale Bright Star Catalogue, packed (tools/make_starfield.py)
     js/vendor/three.min.js       # three.js r147 UMD -> global `THREE`
     js/vendor/OrbitControls.js   # attaches THREE.OrbitControls
     js/util.js               # SAT.util   (core team)
@@ -130,15 +138,25 @@ Methods:
   (memoized per segment in `_segRecs`), else the base `_satrec`. All
   propagation entry points below route through this, so segmented sats are
   piecewise-propagated automatically (tracks/passes stitch across segments).
+- All SGP4 calls go through an internal `prop(rec, date)`: for deep-space
+  resonant orbits (`satrec.irez != 0`: GEO, Molniya) it checkpoints the
+  integrator state (`atime/xli/xni`, kept on the satrec by the patched
+  satellite.min.js) and resumes from the nearest checkpoint at or before the
+  target time instead of re-integrating from the TLE epoch — bit-identical
+  results, ~200 µs -> ~10 µs per call for an old elset.
 - `geodetic(satEntry, date) -> null | { latDeg, lonDeg, heightKm, velKmS, eciPos:{x,y,z}, gmst }`
+  — memoized per sat for the latest `date` (all views ask for the same clock
+  instant each frame); treat the returned object as read-only.
 - `periodMinutes(satEntry) -> number` (from satrec.no_kozai, rad/min).
 - `groundTrack(satEntry, date, minutesBack, minutesFwd) -> { points: [ {t:ms, latDeg, lonDeg, heightKm, sunlit:bool} | null ] }`
   (`sunlit` = satellite outside Earth's shadow at that sample — consumers
   render eclipsed stretches dashed/faint)
-  ~240 samples; **`null` entries mark antimeridian splits** (consumers start a new
-  polyline at null). Internally cached per sat; cache auto-invalidates when the
-  requested date drifts >1/8 period from cache center, on `'time' jumped:true`, and
-  on `'sats-changed'`. Pass `minutesBack/Fwd = 0` for auto (half period back, one fwd).
+  ~240 samples, longitudes wrapped to [-180, 180) and **not** split at the
+  antimeridian (the 2D map unwraps consecutive samples itself; the globe needs
+  no split); a **`null` entry marks a propagation gap** (start a new polyline).
+  Cached per sat *and* window length; auto-invalidates when the requested date
+  drifts >1/8 period from cache center, on `'time' jumped:true`, and on
+  `'sats-changed'`. Pass `minutesBack/Fwd = 0` for auto (half period back, one fwd).
 - `orbitEci(satEntry, date, nSamples=180) -> [{x,y,z}(km ECI), ...]` one full period
   centered on `date` (cached same policy as groundTrack).
 - `footprint(latDeg, lonDeg, heightKm, n=90) -> [{latDeg, lonDeg}, ...]` horizon
@@ -187,7 +205,17 @@ Each is initialized from main.js via `SAT.windows.register({... build: (body, wi
 ### SAT.map2d.init(bodyEl, win)  — AGENT A (js/map2d.js)
 
 2D equirectangular world map on `<canvas>`, SatObserver-style main view.
-- Base layer `assets/earth_day.jpg` (plate carrée: x=(lon+180)/360*W, y=(90-lat)/180*H).
+- Base layer: Blue Marble tile pyramid `assets/bm/` (plate carrée: x=(lon+180)/360*W,
+  y=(90-lat)/180*H). The level whose width covers the on-screen world width is
+  picked; visible tiles are fetched + decoded off-thread (`createImageBitmap`,
+  4 in flight, newest first, LRU of 32 decoded tiles above level 0) and
+  composited into an offscreen canvas rebuilt only when the view or the loaded
+  tile set changes; level 0 is the always-present backdrop, the parent level's
+  quadrant stands in while a tile loads.
+- Drawable domain lon **-360..+360** (`view.cx` -0.5..1.5; fit view = -180..180):
+  imagery, night shade/terminator, graticule (wrapped labels), tracks,
+  footprints, markers, stations, sun and moon are drawn in every world copy
+  that is visible, so a view centred on the antimeridian is seamless.
 - Pan (drag) & zoom (wheel, toward cursor; 1x..40x), double-click to reset fit.
   Canvas fills the window body; handle `'win-resize'` + devicePixelRatio.
 - Layers (respect `SAT.state.settings.map2d` + per-sat `show` flags, re-render on
@@ -205,17 +233,35 @@ Each is initialized from main.js via `SAT.windows.register({... build: (body, wi
   Bottom-left readout: for selected sat show `NAME  lat lon alt(km) | az el range` (az/el/range
   vs active location if any).
 - Performance: render only on demand (dirty flag + rAF); tracks come from
-  `SAT.prop.groundTrack` (cached); avoid full-image redraw cost by drawing the base
-  image with canvas transform.
+  `SAT.prop.groundTrack` (cached); the base imagery is one device-pixel blit of
+  the cached composite. Clock ticks re-render only once the fastest LEO motion
+  (~7.8 km/s) would move ~0.3 px at the current zoom, or every 250 ms for the
+  readouts (time jumps re-render at once).
 - Expose: `SAT.map2d = { init, requestRender }`.
 
 ### SAT.globe3d.init(bodyEl, win)  — AGENT B (js/globe3d.js)
 
 three.js (r147 UMD, global THREE + THREE.OrbitControls) 3D view, Earth-fixed (ECEF) frame.
-- Sphere radius 1 unit = SAT.prop.Re km; texture `assets/earth_day.jpg`; optional
-  night-lights blend (`assets/earth_night.jpg`) via custom ShaderMaterial with sun
-  direction uniform (from `SAT.util.sunSubpoint`); subtle atmosphere rim; star field
-  (procedural points); directional sun light + soft ambient.
+- Sphere radius 1 unit = SAT.prop.Re km; texture `assets/earth_day_8k.webp`
+  (fallback `assets/earth_day.jpg` if the GPU max texture size is < 8192 or the
+  WebP fails to load); optional
+  night-lights blend (`assets/earth_night_8k.webp`, same fallback rule to
+  `assets/earth_night.jpg`) via custom ShaderMaterial with sun direction uniform
+  (from `SAT.util.sunSubpoint`); the night term lifts bright texels (city
+  lights, ~2x linear) but leaves the faint moonlit terrain near its own level;
+  subtle atmosphere rim;
+  directional sun light + soft ambient.
+- Terminator: great-circle LineLoop (gold `#ffd54f`) normal to the sun direction,
+  `settings.globe3d.showTerminator` (TL button).
+- Sky: `SAT.bsc5` stars (shader points, size/brightness by V mag, colour by B-V)
+  and a Milky Way glow (SAT.mwdata isophotes painted into an RA/Dec texture on
+  a sphere) in a group rotated by -gmst; vertex shaders apply only the camera
+  rotation, so both sit at infinity. `settings.globe3d.showStars` (✶ button).
+- Render on demand: clock ticks refresh the scene once the fastest LEO motion
+  would move ~0.3 px at the current camera distance (every tick in FS mode, at
+  least every 250 ms); frames are drawn only when the scene or the camera
+  changed. Orbit/track lines are sampled only when shown; routine refreshes
+  share a 4 ms budget per update (forced rebuilds are never deferred).
 - Per sat (ECI->ECEF with gmst): point marker (sprite/small sphere, sat color),
   name label (canvas sprite, respect `show.label`), orbit line (one period,
   `SAT.prop.orbitEci` rotated rigidly by current gmst, respect `show.orbit`),

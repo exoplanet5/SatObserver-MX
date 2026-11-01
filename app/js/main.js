@@ -24,7 +24,9 @@
         'Space = run/pause · N = jump to real time (when not typing in a field).']),
       U.el('div', { class: 'sep' }),
       U.el('p', { class: 'dim', style: 'margin:4px 0;font-size:11px' },
-        'Base map: NASA Blue Marble Next Generation (topography + bathymetry, no political borders). ' +
+        'Base map: NASA Blue Marble Next Generation, Sept 2004, 21600×10800 (topography + bathymetry, ' +
+        'no political borders). Night lights: NASA Black Marble 2016 (Suomi NPP VIIRS). ' +
+        'Globe stars: Yale Bright Star Catalogue (to mag 6.5). ' +
         'Propagation: satellite.js (SGP4). Data: CelesTrak, Space-Track, Mike McCants. ' +
         'State is saved automatically to data/state.json next to server.py.'),
     ]));
